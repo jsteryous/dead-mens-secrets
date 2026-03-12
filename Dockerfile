@@ -12,5 +12,7 @@ RUN pip install -r requirements.txt
 
 COPY . .
 
-# Default: run once (Railway cron will trigger this)
-CMD ["python", "generate_video.py"]
+# Unbuffered output — logs appear in real time in Railway
+ENV PYTHONUNBUFFERED=1
+
+CMD ["python", "-u", "generate_video.py"]
