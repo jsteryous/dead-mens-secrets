@@ -103,6 +103,12 @@ def claude(model, prompt, max_tokens=800):
     return r.json()["content"][0]["text"].strip()
 
 def get_youtube_token():
+    print(f"Getting YouTube token...")
+    print(f"  CLIENT_ID set: {bool(YOUTUBE_CLIENT_ID)}")
+    print(f"  CLIENT_SECRET set: {bool(YOUTUBE_CLIENT_SECRET)}")
+    print(f"  REFRESH_TOKEN set: {bool(YOUTUBE_REFRESH_TOKEN)}")
+    print(f"  REFRESH_TOKEN length: {len(YOUTUBE_REFRESH_TOKEN) if YOUTUBE_REFRESH_TOKEN else 0}")
+
     r = requests.post(
         "https://oauth2.googleapis.com/token",
         data={"client_id": YOUTUBE_CLIENT_ID,
@@ -110,9 +116,14 @@ def get_youtube_token():
               "refresh_token": YOUTUBE_REFRESH_TOKEN,
               "grant_type": "refresh_token"}
     )
+    print(f"  Token response status: {r.status_code}")
     data = r.json()
+    print(f"  Token response keys: {list(data.keys())}")
+    if "error" in data:
+        print(f"  Token error detail: {data.get('error')} — {data.get('error_description')}")
     if "access_token" not in data:
         raise Exception(f"Token error: {data}")
+    print(f"  Token obtained successfully")
     return data["access_token"]
 
 
