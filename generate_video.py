@@ -54,15 +54,20 @@ FONT      = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
 W, H      = 1080, 1920
 CAPTION_Y = int(H * 0.72)
 
-# Visual style applied to every generated image
-IMAGE_STYLE = (
-    "dark oil painting style, dramatic chiaroscuro lighting, "
-    "cinematic composition, rich shadows, historically detailed, "
-    "masterpiece quality, moody atmosphere, deep blacks"
-)
+# Era-based visual styles — matched to story period and tone
+VISUAL_STYLES = {
+    "oil_painting":           "dark oil painting style, dramatic chiaroscuro lighting, cinematic, rich shadows, historically detailed, masterpiece quality, moody atmosphere",
+    "cold_war_photo":         "gritty cold war era photography, grainy black and white, surveillance aesthetic, stark contrast, Soviet brutalist architecture, documentary style",
+    "daguerreotype":          "Victorian daguerreotype photograph style, sepia tones, aged, formal composition, 19th century aesthetic, antique photograph",
+    "illuminated_manuscript": "medieval illuminated manuscript style, rich gold leaf, intricate borders, gothic lettering, candlelit parchment, dark ages aesthetic",
+    "noir_photograph":        "1940s film noir photography, deep shadows, venetian blind light, cigarette smoke, black and white, expressionist angles",
+    "renaissance_painting":   "Renaissance oil painting style, chiaroscuro, dramatic religious lighting, classical composition, Caravaggio influence, rich jewel tones",
+    "gritty_documentary":     "gritty documentary photography, raw, unflinching, high contrast, photojournalism style, harsh flash lighting, modern realism",
+}
+DEFAULT_STYLE = "oil_painting"
 IMAGE_NEGATIVE = (
-    "blurry, low quality, modern, cartoon, anime, bright colors, "
-    "cheerful, stock photo, watermark, text, logo"
+    "blurry, low quality, cartoon, anime, bright cheerful colors, "
+    "stock photo, watermark, text overlay, logo, modern digital art"
 )
 
 
@@ -393,20 +398,23 @@ Story analysis:
 
 Write the script AND visual direction.
 
+CRITICAL: Output ONLY the raw spoken script first — no headers, no "SCRIPT:", no markdown, no asterisks, no labels. Just the words Alex will speak.
+
 SCRIPT RULES:
 - Sentence 1 (HOOK): Most shocking fact. Cold. Immediate. No warmup.
 - Sentences 2-4 (CONTEXT): Minimum viable context. Every word earns its place.
 - Sentences 5-8 (ESCALATION): Stack specific details. Build dread.
 - Final sentence (TWIST): Recontextualizes everything. Last word closes like a door.
 - 130-150 words MAX
-- No stage directions, headers, asterisks
+- NO stage directions, headers, asterisks, labels, or any formatting whatsoever
 - Statements only — no questions
 - Conversational, urgent, intimate voice
 
-After the script output these on separate lines:
+After the raw script, output these on separate lines:
 
 HOOK_WORD: [single most shocking word — shown alone first]
-SCENES: [5-6 image prompts separated by | — each describes exactly what should appear on screen for that part of the story. Be specific: who, what, where, mood. These will be painted by AI.]
+VISUAL_STYLE: [one of: oil_painting | cold_war_photo | daguerreotype | illuminated_manuscript | noir_photograph | renaissance_painting | gritty_documentary — pick the style that matches this story's era and tone]
+SCENES: [5-6 image prompts separated by | — specific scene, specific mood, specific era. These go to an AI image generator.]
 BEAT_TIMES: [2-3 percentage points for visual cuts e.g. 25|55|78]
 THUMBNAIL_TEXT: [5-7 words MAX — unbearable curiosity]
 TITLE: [YouTube title max 70 chars — engineered for click-through]
@@ -416,7 +424,7 @@ TAGS: [10 hashtags separated by |]""", max_tokens=1000)
     for line in raw.split("\n"):
         parsed = False
         for k in ["HOOK_WORD:", "SCENES:", "BEAT_TIMES:",
-                  "THUMBNAIL_TEXT:", "TITLE:", "TAGS:"]:
+                  "THUMBNAIL_TEXT:", "TITLE:", "TAGS:", "VISUAL_STYLE:"]:
             if line.startswith(k):
                 meta[k.rstrip(":")] = line[len(k):].strip()
                 parsed = True
@@ -424,7 +432,13 @@ TAGS: [10 hashtags separated by |]""", max_tokens=1000)
         if not parsed:
             script_lines.append(line)
 
+    # Strip ALL markdown artifacts Claude might add
+    import re
     script = "\n".join(script_lines).strip()
+    script = re.sub(r'^#+\s*(SCRIPT|Script):?\s*', '', script, flags=re.MULTILINE)
+    script = re.sub(r'^\*\*.*?\*\*\s*', '', script, flags=re.MULTILINE)
+    script = re.sub(r'^---+$', '', script, flags=re.MULTILINE)
+    script = script.strip()
 
     # Parse beat times
     beat_times = []
@@ -457,16 +471,21 @@ TAGS: [10 hashtags separated by |]""", max_tokens=1000)
     print(f"Script: {len(script.split())} words | Hook: {hook_word}")
     print(f"Scenes: {len(scene_prompts)} visual prompts")
     print(f"Opening: {script[:100]}...")
-    return script, hook_word, scene_prompts, beat_times, thumb_text, title, tags
+    visual_style = meta.get("VISUAL_STYLE", DEFAULT_STYLE).strip()
+    if visual_style not in VISUAL_STYLES:
+        visual_style = DEFAULT_STYLE
+    print(f"Visual style: {visual_style}")
+    return script, hook_word, scene_prompts, visual_style, beat_times, thumb_text, title, tags
 
 
 # ══════════════════════════════════════════════════════════════════════════════
 # PHASE 3: AI IMAGE GENERATION
 # ══════════════════════════════════════════════════════════════════════════════
 
-def generate_image_replicate(prompt, tmpdir, index):
+def generate_image_replicate(prompt, style, tmpdir, index):
     """Generate one image via Replicate Flux model. 9:16 portrait native."""
-    full_prompt = f"{prompt}, {IMAGE_STYLE}"
+    style_desc = VISUAL_STYLES.get(style, VISUAL_STYLES[DEFAULT_STYLE])
+    full_prompt = f"{prompt}, {style_desc}"
 
     try:
         # Start the prediction
@@ -543,9 +562,9 @@ def generate_image_replicate(prompt, tmpdir, index):
         return None
 
 
-def generate_all_images(scene_prompts, tmpdir):
+def generate_all_images(scene_prompts, visual_style, tmpdir):
     """Generate all scene images in parallel for speed."""
-    print(f"Generating {len(scene_prompts)} AI images via Replicate...")
+    print(f"Generating {len(scene_prompts)} AI images via Replicate (style: {visual_style})...")
 
     if not REPLICATE_API_KEY:
         print("No Replicate key — falling back to Pexels")
@@ -555,7 +574,7 @@ def generate_all_images(scene_prompts, tmpdir):
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=3) as executor:
         futures = {
-            executor.submit(generate_image_replicate, prompt, tmpdir, i): i
+            executor.submit(generate_image_replicate, prompt, visual_style, tmpdir, i): i
             for i, prompt in enumerate(scene_prompts)
         }
         for future in concurrent.futures.as_completed(futures):
@@ -1208,12 +1227,12 @@ def main():
         # ── PHASE 2: CREATE ───────────────────────────────────────────────
         topic                                              = generate_topic(insights)
         research                                           = research_topic(topic, insights)
-        script, hook_word, scene_prompts, beat_times, \
+        script, hook_word, scene_prompts, visual_style, beat_times, \
             thumb_text, title, tags                        = write_script(topic, research, insights)
 
         # ── PHASE 3: GENERATE VISUALS (parallel with voiceover) ───────────
         with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
-            images_future = executor.submit(generate_all_images, scene_prompts, tmpdir)
+            images_future = executor.submit(generate_all_images, scene_prompts, visual_style, tmpdir)
             voice_future  = executor.submit(generate_voiceover, script, audio_path)
 
             image_paths  = images_future.result()
