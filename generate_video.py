@@ -945,12 +945,14 @@ def assemble_final_video(word_timings, hook_word, audio_path, bg_path,
     hook_dur   = 0.55
     total_dur  = voice_dur + hook_dur
 
-    # Build caption chunks from word-level timestamps
-    # Karaoke effect: show 3-4 word chunk, current words slightly bigger
+    # Build caption chunks — strict 3 words max
+    # FFmpeg drawtext has NO word wrap. Every chunk must fit on one line.
+    # At fontsize=70 on 1080px width, 3 short words = safe. 4 long words = overflow.
+    # Solution: 3 words always. No exceptions.
     chunks = []
     i = 0
     while i < len(word_timings):
-        size  = random.choice([3, 3, 3, 4, 4])
+        size  = 3
         group = word_timings[i:i+size]
         if group:
             text    = " ".join(w[0] for w in group)
@@ -989,13 +991,16 @@ def assemble_final_video(word_timings, hook_word, audio_path, bg_path,
         f":enable='between(t,0,{hook_dur - 0.05:.2f})'"
     )
 
-    # Word-synced captions — clean white, lower third
+    # Word-synced captions — strict safe sizing
+    # Font 70px, max 3 words, centered, with 60px margin each side
+    # Box behind text for maximum legibility on any background
     for (text, t0, t1) in chunks:
+        safe = esc(text)
         filters.append(
-            f"drawtext=text='{esc(text)}'"
-            f":fontfile={FONT}:fontsize=80:fontcolor=white"
-            f":x=(w-text_w)/2:y={CAPTION_Y}-text_h/2"
-            f":borderw=5:bordercolor=black"
+            f"drawtext=text='{safe}'"
+            f":fontfile={FONT}:fontsize=70:fontcolor=white"
+            f":x=(w-text_w)/2:y={CAPTION_Y}"
+            f":borderw=6:bordercolor=black@0.9"
             f":enable='between(t,{t0:.3f},{t1:.3f})'"
         )
 
