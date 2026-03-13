@@ -70,10 +70,11 @@ VISUAL_STYLES = {
 }
 DEFAULT_STYLE = "oil_painting"
 
-# ── CLASSICAL MUSIC ───────────────────────────────────────────────────────────
-# Public domain. Curated for the channel's emotional register:
-# melancholic, inevitable, cinematic weight.
-CLASSICAL_TRACKS = [
+# ── MUSIC ─────────────────────────────────────────────────────────────────────
+# Pulled from Supabase Storage music/ bucket — your approved tracks only.
+# Upload any audio file (mp3, ogg, wav) to the music/ bucket in Supabase.
+# Falls back to public domain Wikimedia tracks if bucket is empty.
+FALLBACK_TRACKS = [
     "https://upload.wikimedia.org/wikipedia/commons/4/43/Bach_-_Toccata_and_Fugue_in_D_minor_BWV_565_-_Toccata.ogg",
     "https://upload.wikimedia.org/wikipedia/commons/e/e9/Gymnopedie_No._1.ogg",
     "https://upload.wikimedia.org/wikipedia/commons/5/57/Moonlight_sonata.ogg",
@@ -927,33 +928,84 @@ def generate_voiceover(script, audio_path):
 
     return word_timings
 
+def list_music_from_supabase():
+    """
+    List all tracks in Supabase Storage music/ bucket.
+    Returns list of (filename, public_url) tuples.
+    """
+    if not SUPABASE_URL or not SUPABASE_KEY:
+        return []
+    try:
+        r = requests.post(
+            f"{SUPABASE_URL}/storage/v1/object/list/music",
+            headers={
+                "apikey":        SUPABASE_KEY,
+                "Authorization": f"Bearer {SUPABASE_KEY}",
+                "Content-Type":  "application/json",
+            },
+            json={"prefix": "", "limit": 100, "offset": 0},
+            timeout=10
+        )
+        if r.status_code != 200:
+            return []
+        files = r.json()
+        return [
+            (f["name"], f"{SUPABASE_URL}/storage/v1/object/public/music/{f['name']}")
+            for f in files
+            if f.get("name") and not f["name"].endswith("/")
+        ]
+    except Exception as e:
+        print(f"  Music list error: {e}")
+        return []
+
+
 def fetch_music(tmpdir):
-    """Download a random classical track. Convert ogg → mp3 for FFmpeg."""
+    """
+    Fetch a random approved track from Supabase Storage music/ bucket.
+    Falls back to public domain Wikimedia tracks if bucket is empty.
+    Converts any format to mp3 via FFmpeg for consistent pipeline handling.
+    """
     print("Fetching music...")
     raw_path   = f"{tmpdir}/music_raw"
     final_path = f"{tmpdir}/music.mp3"
 
-    for url in random.sample(CLASSICAL_TRACKS, len(CLASSICAL_TRACKS)):
+    def try_download_and_convert(url, label):
         try:
-            r = requests.get(url, timeout=25, stream=True,
+            r = requests.get(url, timeout=30, stream=True,
                              headers={"User-Agent": "DeadMensSecrets/1.0"})
             if r.status_code != 200:
-                continue
+                return False
             with open(raw_path, "wb") as f:
                 for chunk in r.iter_content(8192):
                     f.write(chunk)
-            if os.path.getsize(raw_path) < 50_000:
-                continue
+            if os.path.getsize(raw_path) < 10_000:
+                return False
             conv = subprocess.run(
                 ["ffmpeg", "-y", "-i", raw_path,
-                 "-c:a", "libmp3lame", "-b:a", "128k", final_path],
+                 "-c:a", "libmp3lame", "-b:a", "128k", "-q:a", "2", final_path],
                 capture_output=True
             )
-            if conv.returncode == 0:
-                print(f"Music: {os.path.getsize(final_path)//1024}KB — {url.split('/')[-1]}")
-                return final_path
+            if conv.returncode == 0 and os.path.exists(final_path):
+                print(f"Music: {os.path.getsize(final_path)//1024}KB — {label}")
+                return True
         except Exception as e:
-            print(f"  Music track failed: {e}")
+            print(f"  Track failed ({label}): {e}")
+        return False
+
+    # Try Supabase music bucket first
+    tracks = list_music_from_supabase()
+    if tracks:
+        print(f"  Found {len(tracks)} tracks in Supabase music library")
+        for name, url in random.sample(tracks, len(tracks)):
+            if try_download_and_convert(url, name):
+                return final_path
+        print("  All Supabase tracks failed — trying fallback")
+
+    # Fallback: public domain Wikimedia
+    print("  Using fallback public domain tracks")
+    for url in random.sample(FALLBACK_TRACKS, len(FALLBACK_TRACKS)):
+        if try_download_and_convert(url, url.split("/")[-1]):
+            return final_path
 
     print("Music unavailable — proceeding without")
     return None
@@ -965,122 +1017,206 @@ def fetch_music(tmpdir):
 # Final: hook frame + captions + branding + music mix
 # ══════════════════════════════════════════════════════════════════════════════
 
-def build_background(image_paths, beat_times, voice_dur, tmpdir):
+# ── CINEMATIC MOTION PROFILES ─────────────────────────────────────────────────
+# Each profile is a distinct camera movement. Assigned round-robin per scene
+# so no two consecutive scenes feel the same.
+# All use 4x upscale before motion to prevent blur on zoom-in.
+MOTION_PROFILES = [
+    # 0: Slow push in — classic documentary, weight and inevitability
+    lambda f: (
+        f"zoompan=z='min(zoom+0.0002,1.05)'"
+        f":x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)'"
+        f":d={f}:s={W}x{H}:fps=30"
+    ),
+    # 1: Slow pull back — reveal, dread building as scene widens
+    lambda f: (
+        f"zoompan=z='if(eq(on,1),1.06,max(1.0,zoom-0.0002))'"
+        f":x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)'"
+        f":d={f}:s={W}x{H}:fps=30"
+    ),
+    # 2: Drift right — lateral pan, surveillance feel
+    lambda f: (
+        f"zoompan=z='1.04'"
+        f":x='iw/2-(iw/zoom/2)+(on/{max(f,1)})*{W//8}':y='ih/2-(ih/zoom/2)'"
+        f":d={f}:s={W}x{H}:fps=30"
+    ),
+    # 3: Drift left with slight zoom — closing in, tightening
+    lambda f: (
+        f"zoompan=z='min(zoom+0.0001,1.04)'"
+        f":x='iw/2-(iw/zoom/2)-((on/{max(f,1)})*{W//10})':y='ih/2-(ih/zoom/2)'"
+        f":d={f}:s={W}x{H}:fps=30"
+    ),
+    # 4: Slow tilt up — from ground to sky, emergence or ascent
+    lambda f: (
+        f"zoompan=z='1.04'"
+        f":x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)-((on/{max(f,1)})*{H//12})'"
+        f":d={f}:s={W}x{H}:fps=30"
+    ),
+    # 5: Slow tilt down — descent, falling, oppression
+    lambda f: (
+        f"zoompan=z='1.04'"
+        f":x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)+((on/{max(f,1)})*{H//12})'"
+        f":d={f}:s={W}x{H}:fps=30"
+    ),
+]
+
+# Color grade per visual style — applied to every clip
+STYLE_GRADE = {
+    "oil_painting":           "colorchannelmixer=rr=0.85:gg=0.80:bb=0.95,eq=contrast=1.15:brightness=-0.04:saturation=0.80",
+    "cold_war_photo":         "colorchannelmixer=rr=0.75:gg=0.78:bb=0.78,eq=contrast=1.30:brightness=-0.06:saturation=0.20",
+    "daguerreotype":          "colorchannelmixer=rr=0.90:gg=0.82:bb=0.65,eq=contrast=1.20:brightness=-0.03:saturation=0.35",
+    "illuminated_manuscript": "colorchannelmixer=rr=0.92:gg=0.85:bb=0.60,eq=contrast=1.10:brightness=0.02:saturation=0.90",
+    "noir_photograph":        "colorchannelmixer=rr=0.70:gg=0.72:bb=0.72,eq=contrast=1.40:brightness=-0.08:saturation=0.10",
+    "renaissance_painting":   "colorchannelmixer=rr=0.88:gg=0.82:bb=0.72,eq=contrast=1.12:brightness=-0.02:saturation=0.85",
+    "gritty_documentary":     "colorchannelmixer=rr=0.82:gg=0.80:bb=0.78,eq=contrast=1.25:brightness=-0.05:saturation=0.65",
+}
+DEFAULT_GRADE = STYLE_GRADE["oil_painting"]
+
+
+def build_cinematic_clip(img_path, dur, motion_idx, visual_style, out_path, tmpdir):
     """
-    Build background video from images.
-    - Ken Burns (slow zoom/pan) on each image
-    - Crossfade transitions between images
-    - Cut timing driven by story beat points
-    - Falls back to dark gradient if no images
+    Render one cinematic clip from a still image.
+    Applies motion profile + style-matched color grade + vignette.
+    Returns True on success.
+
+    Motion: chosen from MOTION_PROFILES round-robin — no two scenes feel the same.
+    Grade:  matched to the visual style of the story (cold war = desaturated, etc.)
+    Flicker: subtle random brightness pulse simulates torch/candlelight on dark scenes.
     """
-    print("Building background...")
+    frames = max(int(dur * 30), 1)
+    motion = MOTION_PROFILES[motion_idx % len(MOTION_PROFILES)](frames)
+    grade  = STYLE_GRADE.get(visual_style, DEFAULT_GRADE)
+
+    # Torch flicker: gentle random brightness variation every ~8 frames
+    # Simulates candlelight / torchlight in dark historical scenes
+    # Subtle enough not to distract, present enough to feel alive
+    flicker = "noise=alls=3:allf=t,lutyuv=y=val+random(0)*8-4"
+
+    vf = (
+        f"scale={W*4}:{H*4}:force_original_aspect_ratio=increase,"
+        f"crop={W*4}:{H*4},"
+        f"{motion},"
+        f"{grade},"
+        f"vignette=PI/3.5,"
+        f"{flicker}"
+    )
+
+    r = run(
+        ["ffmpeg", "-y", "-loop", "1", "-i", img_path,
+         "-vf", vf,
+         "-t", str(dur + 0.5),
+         "-c:v", "libx264", "-preset", "fast", "-crf", "18",
+         "-pix_fmt", "yuv420p", "-an", out_path],
+        check=False
+    )
+    return r.returncode == 0 and os.path.exists(out_path)
+
+
+def build_background(image_paths, beat_times, voice_dur, tmpdir, visual_style=DEFAULT_STYLE):
+    """
+    Build cinematic background video from AI-generated images.
+
+    Each image gets a distinct motion profile (push, pull, drift, tilt) —
+    never the same movement twice in a row. Color grade is matched to the
+    story's visual style. Torch flicker adds life to static images.
+    Scenes are joined with 0.5s crossfade transitions.
+
+    Falls back gracefully: fewer images → cycle them. No images → dark gradient.
+    """
+    print("Building cinematic background...")
     bg = f"{tmpdir}/bg.mp4"
 
+    # Dark animated gradient fallback — better than a hard black screen
     if not image_paths:
         run(["ffmpeg", "-y", "-f", "lavfi",
              "-i", f"color=c=0x08080f:size={W}x{H}:duration={voice_dur}:rate=30",
-             "-vf", "noise=alls=5:allf=t+u",
-             "-c:v", "libx264", "-preset", "fast", "-crf", "28", bg])
+             "-vf", "noise=alls=6:allf=t+u,vignette=PI/3",
+             "-c:v", "libx264", "-preset", "fast", "-crf", "28",
+             "-pix_fmt", "yuv420p", bg])
         return bg
 
-    # Segment durations driven by beat points
+    # Segment durations from beat points — each beat = scene cut
     pts  = sorted(set([0.0] + beat_times + [1.0]))
     durs = [(pts[i+1] - pts[i]) * voice_dur for i in range(len(pts) - 1)]
 
-    # Cycle images to fill segments
-    imgs = image_paths * (len(durs) // len(image_paths) + 1)
-    imgs = imgs[:len(durs)]
+    # Cycle images if fewer than segments
+    imgs = (image_paths * (len(durs) // len(image_paths) + 1))[:len(durs)]
 
-    # Ken Burns clip per image
-    kb_clips = []
+    # Render each image as a cinematic clip
+    clips = []
     for i, (img, dur) in enumerate(zip(imgs, durs)):
-        out    = f"{tmpdir}/kb_{i}.mp4"
-        frames = max(int(dur * 30), 1)
-
-        # Alternate zoom direction for visual variety
-        if i % 2 == 0:
-            zoom = (f"zoompan=z='min(zoom+0.0003,1.06)'"
-                    f":x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)'"
-                    f":d={frames}:s={W}x{H}:fps=30")
+        out = f"{tmpdir}/cin_{i}.mp4"
+        ok  = build_cinematic_clip(img, dur, i, visual_style, out, tmpdir)
+        if ok:
+            clips.append((out, dur))
         else:
-            offset = i * 3
-            zoom   = (f"zoompan=z='if(lte(zoom,1.0),1.06,max(1.0,zoom-0.0003))'"
-                      f":x='iw/2-(iw/zoom/2)+{offset}':y='ih/2-(ih/zoom/2)'"
-                      f":d={frames}:s={W}x{H}:fps=30")
-
-        vf = (f"scale={W*4}:{H*4}:force_original_aspect_ratio=increase,"
-              f"crop={W*4}:{H*4},{zoom},"
-              f"colorchannelmixer=rr=0.85:gg=0.82:bb=0.95,"
-              f"eq=contrast=1.1:brightness=-0.03:saturation=0.85,"
-              f"vignette=PI/4")
-
-        r = run(["ffmpeg", "-y", "-i", img,
-                 "-vf", vf, "-t", str(dur + 0.5),
-                 "-c:v", "libx264", "-preset", "fast", "-crf", "20", "-an", out],
-                check=False)
-
-        if r.returncode == 0 and os.path.exists(out):
-            kb_clips.append((out, dur))
-        else:
-            # Simple static fallback for this image
+            # Fallback: plain static scaled clip
             sout = f"{tmpdir}/static_{i}.mp4"
             run(["ffmpeg", "-y", "-loop", "1", "-i", img,
                  "-t", str(dur + 0.5),
                  "-vf", f"scale={W}:{H}:force_original_aspect_ratio=increase,crop={W}:{H}",
-                 "-c:v", "libx264", "-preset", "fast", "-crf", "20", "-an", sout],
+                 "-c:v", "libx264", "-preset", "fast", "-crf", "22",
+                 "-pix_fmt", "yuv420p", "-an", sout],
                 check=False)
             if os.path.exists(sout):
-                kb_clips.append((sout, dur))
+                clips.append((sout, dur))
 
-    if not kb_clips:
+    if not clips:
         return build_background([], beat_times, voice_dur, tmpdir)
 
-    # Single clip — no crossfade needed
-    if len(kb_clips) == 1:
-        concat = f"{tmpdir}/concat.txt"
-        with open(concat, "w") as f:
-            f.write(f"file '{kb_clips[0][0]}'\n")
-        run(["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", concat,
+    # Single clip
+    if len(clips) == 1:
+        run(["ffmpeg", "-y", "-i", clips[0][0],
              "-t", str(voice_dur), "-c:v", "libx264", "-preset", "fast",
              "-crf", "22", "-pix_fmt", "yuv420p", bg])
         return bg
 
-    # Multiple clips — xfade crossfades
-    xfade     = 0.4
-    inputs    = sum([["-i", c] for c, _ in kb_clips], [])
-    parts     = []
-    label     = "[0:v]"
-    offset    = 0.0
+    # Crossfade chain — 0.5s overlap between each scene
+    xfade  = 0.5
+    inputs = sum([["-i", c] for c, _ in clips], [])
+    parts  = []
+    label  = "[0:v]"
+    offset = 0.0
 
-    for i in range(1, len(kb_clips)):
-        offset   += kb_clips[i-1][1] - xfade
-        offset    = max(offset, 0.01)
-        next_lbl  = f"[v{i}]" if i < len(kb_clips) - 1 else "[vout]"
-        parts.append(f"{label}[{i}:v]xfade=transition=fade:duration={xfade}:offset={offset:.3f}{next_lbl}")
-        label = next_lbl
+    for i in range(1, len(clips)):
+        offset  += clips[i-1][1] - xfade
+        offset   = max(offset, 0.01)
+        nxt      = f"[v{i}]" if i < len(clips) - 1 else "[vout]"
+        parts.append(
+            f"{label}[{i}:v]xfade=transition=fade"
+            f":duration={xfade}:offset={offset:.3f}{nxt}"
+        )
+        label = nxt
 
-    r = run(["ffmpeg", "-y"] + inputs + [
-        "-filter_complex", ";".join(parts),
-        "-map", "[vout]",
-        "-t", str(voice_dur),
-        "-c:v", "libx264", "-preset", "fast", "-crf", "20", "-pix_fmt", "yuv420p",
-        bg
-    ], check=False)
+    r = run(
+        ["ffmpeg", "-y"] + inputs + [
+            "-filter_complex", ";".join(parts),
+            "-map", "[vout]",
+            "-t", str(voice_dur),
+            "-c:v", "libx264", "-preset", "fast", "-crf", "18",
+            "-pix_fmt", "yuv420p", bg
+        ],
+        check=False
+    )
 
     if r.returncode != 0:
-        print("Crossfade failed — simple concat fallback")
-        concat = f"{tmpdir}/concat_s.txt"
-        with open(concat, "w") as f:
-            for c, _ in kb_clips:
+        # Fallback: simple concat without transitions
+        print("Crossfade failed — concat fallback")
+        lst = f"{tmpdir}/list.txt"
+        with open(lst, "w") as f:
+            for c, _ in clips:
                 f.write(f"file '{c}'\n")
-        r2 = run(["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", concat,
-                  "-t", str(voice_dur), "-vf", f"scale={W}:{H}",
-                  "-c:v", "libx264", "-preset", "fast", "-crf", "22",
-                  "-pix_fmt", "yuv420p", bg], check=False)
+        r2 = run(
+            ["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", lst,
+             "-t", str(voice_dur), "-vf", f"scale={W}:{H}",
+             "-c:v", "libx264", "-preset", "fast", "-crf", "22",
+             "-pix_fmt", "yuv420p", bg],
+            check=False
+        )
         if r2.returncode != 0:
             return build_background([], beat_times, voice_dur, tmpdir)
 
-    print(f"Background: {voice_dur:.1f}s")
+    print(f"Cinematic background: {voice_dur:.1f}s, {len(clips)} scenes")
     return bg
 
 def assemble_video(word_timings, hook_word, audio_path, bg_path,
@@ -1340,7 +1476,7 @@ def main():
         # ── PHASE 4: PRODUCE ──────────────────────────────────────────────
         voice_dur  = get_duration(audio_path)
         music_path = fetch_music(tmpdir)
-        bg_path    = build_background(image_paths, beat_times, voice_dur, tmpdir)
+        bg_path    = build_background(image_paths, beat_times, voice_dur, tmpdir, visual_style)
         assemble_video(word_timings, hook_word, audio_path, bg_path,
                        music_path, beat_times, output_path)
         thumb_path = build_thumbnail(thumb_text, image_paths, tmpdir)
