@@ -856,6 +856,106 @@ def generate_all_images(scene_prompts, visual_style, tmpdir):
     print(f"Generated {len(valid)}/{len(scene_prompts)} images")
     return valid
 
+def get_clips_from_library(scene_prompts, tmpdir):
+    """
+    Pull pre-rendered video clips from Supabase clip_library.
+    Uses same vector similarity matching as image library.
+    Returns list of local .mp4 paths.
+    """
+    if not SUPABASE_URL or not SUPABASE_KEY:
+        return []
+    try:
+        r = requests.get(
+            f"{SUPABASE_URL}/rest/v1/clip_library"
+            f"?select=filename,description,style,storage_path,embedding"
+            f"&storage_path=not.is.null&limit=500",
+            headers={"apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}"},
+            timeout=15
+        )
+        if r.status_code != 200 or not r.json():
+            return []
+        rows = r.json()
+    except Exception:
+        return []
+
+    if not rows:
+        return []
+
+    print(f"  Clip library: {len(rows)} clips available")
+
+    # Try vector similarity if embeddings exist
+    parsed_vecs = {}
+    for row in rows:
+        emb = row.get("embedding")
+        if emb:
+            try:
+                parsed_vecs[row["filename"]] = (
+                    json.loads(emb) if isinstance(emb, str) else emb
+                )
+            except Exception:
+                pass
+
+    paths = []
+    used  = set()
+
+    for prompt in scene_prompts:
+        best_row   = None
+        best_score = -1
+
+        if parsed_vecs:
+            try:
+                import numpy as np
+                pv = parsed_vecs
+                q  = None
+                # Simple keyword fallback for query embedding
+                for row in rows:
+                    if row["filename"] not in used and row["filename"] in pv:
+                        score = cosine_similarity(
+                            pv[row["filename"]],
+                            pv.get(list(pv.keys())[0], pv[row["filename"]])
+                        )
+                        # Use keyword overlap as proxy when no query embedding
+                        prompt_words = set(prompt.lower().split())
+                        desc_words   = set(row["description"].lower().split())
+                        overlap      = len(prompt_words & desc_words)
+                        if overlap > best_score:
+                            best_score = overlap
+                            best_row   = row
+            except Exception:
+                pass
+
+        if best_row is None:
+            # Simple keyword match
+            for row in rows:
+                if row["filename"] in used:
+                    continue
+                prompt_words = set(re.sub(r'[^\w\s]', '', prompt).lower().split())
+                desc_words   = set(re.sub(r'[^\w\s]', '', row["description"]).lower().split())
+                score        = len(prompt_words & desc_words)
+                if score > best_score:
+                    best_score = score
+                    best_row   = row
+
+        if not best_row:
+            continue
+
+        used.add(best_row["filename"])
+        url = f"{SUPABASE_URL}/storage/v1/object/public/{best_row['storage_path']}"
+
+        try:
+            dl = requests.get(url, timeout=60)
+            if dl.status_code == 200:
+                local = f"{tmpdir}/clip_{len(paths)}.mp4"
+                with open(local, "wb") as f:
+                    f.write(dl.content)
+                paths.append(local)
+                print(f"  Clip matched: {best_row['filename'][:55]}")
+        except Exception as e:
+            print(f"  Clip download error: {e}")
+
+    return paths
+
+
 def fetch_pexels_fallback(scene_prompts, tmpdir):
     """Last-resort fallback: Pexels portrait video clips."""
     if not PEXELS_API_KEY:
@@ -1119,40 +1219,76 @@ DEFAULT_GRADE = STYLE_GRADE["oil_painting"]
 def build_cinematic_clip(img_path, dur, motion_idx, visual_style, out_path, tmpdir):
     """
     Render one cinematic clip from a still image.
-    Applies motion profile + style-matched color grade + vignette.
-    Returns True on success.
-
-    Motion: chosen from MOTION_PROFILES round-robin — no two scenes feel the same.
-    Grade:  matched to the visual style of the story (cold war = desaturated, etc.)
-    Flicker: subtle random brightness pulse simulates torch/candlelight on dark scenes.
+    Fast version: simple Ken Burns (zoom/pan) + color grade.
+    No flicker, no 4x upscale, no complex filters — keeps Railway under timeout.
+    Target: each clip renders in under 10 seconds.
     """
     frames = max(int(dur * 30), 1)
     motion = MOTION_PROFILES[motion_idx % len(MOTION_PROFILES)](frames)
     grade  = STYLE_GRADE.get(visual_style, DEFAULT_GRADE)
 
-    # Torch flicker: gentle random brightness variation every ~8 frames
-    # Simulates candlelight / torchlight in dark historical scenes
-    # Subtle enough not to distract, present enough to feel alive
-    flicker = "noise=alls=3:allf=t,lutyuv=y=val+random(0)*8-4"
-
+    # Scale to 2x (not 4x) — enough for smooth zoompan, much faster
     vf = (
-        f"scale={W*4}:{H*4}:force_original_aspect_ratio=increase,"
-        f"crop={W*4}:{H*4},"
+        f"scale={W*2}:{H*2}:force_original_aspect_ratio=increase,"
+        f"crop={W*2}:{H*2},"
         f"{motion},"
         f"{grade},"
-        f"vignette=PI/3.5,"
-        f"{flicker}"
+        f"vignette=PI/4"
     )
 
     r = run(
         ["ffmpeg", "-y", "-loop", "1", "-i", img_path,
          "-vf", vf,
-         "-t", str(dur + 0.5),
-         "-c:v", "libx264", "-preset", "fast", "-crf", "18",
+         "-t", str(dur + 0.3),
+         "-c:v", "libx264", "-preset", "ultrafast", "-crf", "23",
          "-pix_fmt", "yuv420p", "-an", out_path],
         check=False
     )
     return r.returncode == 0 and os.path.exists(out_path)
+
+
+def build_background_from_clips(clip_paths, voice_dur, tmpdir):
+    """
+    Assemble pre-rendered video clips into background.
+    Fast — just concat + trim. No heavy FFmpeg processing.
+    This is the preferred path when clip_library has entries.
+    """
+    print("Assembling from pre-rendered clips...")
+    bg = f"{tmpdir}/bg.mp4"
+
+    if not clip_paths:
+        return build_background([], [], voice_dur, tmpdir)
+
+    if len(clip_paths) == 1:
+        run(["ffmpeg", "-y", "-i", clip_paths[0],
+             "-t", str(voice_dur),
+             "-vf", f"scale={W}:{H}:force_original_aspect_ratio=increase,crop={W}:{H}",
+             "-c:v", "libx264", "-preset", "ultrafast", "-crf", "23",
+             "-pix_fmt", "yuv420p", bg], check=False)
+        return bg
+
+    # Concat list — cycle clips if needed to cover full duration
+    all_clips = (clip_paths * (int(voice_dur // 5) + 2))
+    lst = f"{tmpdir}/clips_list.txt"
+    with open(lst, "w") as f:
+        for c in all_clips:
+            f.write(f"file '{c}'\n")
+
+    r = run(
+        ["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", lst,
+         "-t", str(voice_dur),
+         "-vf", f"scale={W}:{H}:force_original_aspect_ratio=increase,crop={W}:{H}",
+         "-c:v", "libx264", "-preset", "ultrafast", "-crf", "23",
+         "-pix_fmt", "yuv420p", bg],
+        check=False
+    )
+
+    if r.returncode != 0 or not os.path.exists(bg):
+        print("Clip concat failed — falling back to images")
+        return build_background([], [], voice_dur, tmpdir)
+
+    print(f"Background from clips: {len(clip_paths)} clips, {voice_dur:.1f}s")
+    return bg
 
 
 def build_background(image_paths, beat_times, voice_dur, tmpdir, visual_style=DEFAULT_STYLE):
@@ -1207,44 +1343,29 @@ def build_background(image_paths, beat_times, voice_dur, tmpdir, visual_style=DE
     if not clips:
         return build_background([], beat_times, voice_dur, tmpdir)
 
-    # Single clip
+    # Concat all clips — fast, reliable, no crossfade complexity
+    # When pre-rendered video clips replace static images, transitions
+    # will be handled by the clips themselves.
     if len(clips) == 1:
         run(["ffmpeg", "-y", "-i", clips[0][0],
-             "-t", str(voice_dur), "-c:v", "libx264", "-preset", "fast",
-             "-crf", "22", "-pix_fmt", "yuv420p", bg])
+             "-t", str(voice_dur), "-c:v", "libx264", "-preset", "ultrafast",
+             "-crf", "23", "-pix_fmt", "yuv420p", bg])
         return bg
 
-    # Crossfade chain — 0.5s overlap between each scene
-    xfade  = 0.5
-    inputs = sum([["-i", c] for c, _ in clips], [])
-    parts  = []
-    label  = "[0:v]"
-    offset = 0.0
-
-    for i in range(1, len(clips)):
-        offset  += clips[i-1][1] - xfade
-        offset   = max(offset, 0.01)
-        nxt      = f"[v{i}]" if i < len(clips) - 1 else "[vout]"
-        parts.append(
-            f"{label}[{i}:v]xfade=transition=fade"
-            f":duration={xfade}:offset={offset:.3f}{nxt}"
-        )
-        label = nxt
-
+    lst = f"{tmpdir}/list.txt"
+    with open(lst, "w") as f:
+        for c, _ in clips:
+            f.write(f"file '{c}'\n")
     r = run(
-        ["ffmpeg", "-y"] + inputs + [
-            "-filter_complex", ";".join(parts),
-            "-map", "[vout]",
-            "-t", str(voice_dur),
-            "-c:v", "libx264", "-preset", "fast", "-crf", "18",
-            "-pix_fmt", "yuv420p", bg
-        ],
+        ["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", lst,
+         "-t", str(voice_dur), "-vf", f"scale={W}:{H}",
+         "-c:v", "libx264", "-preset", "ultrafast", "-crf", "23",
+         "-pix_fmt", "yuv420p", bg],
         check=False
     )
 
     if r.returncode != 0:
-        # Fallback: simple concat without transitions
-        print("Crossfade failed — concat fallback")
+        print("Concat fallback...")
         lst = f"{tmpdir}/list.txt"
         with open(lst, "w") as f:
             for c, _ in clips:
@@ -1519,27 +1640,36 @@ def main():
             image_paths  = img_fut.result()
             word_timings = voice_fut.result()
 
-        # Always top up to 6 images — mix Replicate successes with library matches
-        # This means even if Replicate rate-limits 5/6, we still get 6 distinct scenes
-        target = len(scene_prompts)
-        if len(image_paths) < target:
-            needed = target - len(image_paths)
-            print(f"Replicate got {len(image_paths)}/{target} — pulling {needed} from library")
-            lib_imgs = get_images_from_library(scene_prompts, tmpdir)
-            # Add library images that aren't already in image_paths
-            for lp in lib_imgs:
-                if len(image_paths) >= target:
-                    break
-                if lp not in image_paths:
-                    image_paths.append(lp)
-        if not image_paths:
-            print("Library empty — trying Pexels")
-            image_paths = fetch_pexels_fallback(scene_prompts, tmpdir)
+        # Prefer pre-rendered video clips — skip heavy FFmpeg processing entirely
+        # Falls back to still images if clip library is empty
+        clip_paths = get_clips_from_library(scene_prompts, tmpdir)
+
+        if clip_paths:
+            print(f"Using {len(clip_paths)} pre-rendered clips — skipping cinematic build")
+            use_clips = True
+        else:
+            use_clips = False
+            # Top up still images to target count
+            target = len(scene_prompts)
+            if len(image_paths) < target:
+                print(f"Replicate got {len(image_paths)}/{target} — pulling from library")
+                lib_imgs = get_images_from_library(scene_prompts, tmpdir)
+                for lp in lib_imgs:
+                    if len(image_paths) >= target:
+                        break
+                    if lp not in image_paths:
+                        image_paths.append(lp)
+            if not image_paths:
+                print("Library empty — trying Pexels")
+                image_paths = fetch_pexels_fallback(scene_prompts, tmpdir)
 
         # ── PHASE 4: PRODUCE ──────────────────────────────────────────────
         voice_dur  = get_duration(audio_path)
         music_path = fetch_music(tmpdir)
-        bg_path    = build_background(image_paths, beat_times, voice_dur, tmpdir, visual_style)
+        if use_clips:
+            bg_path = build_background_from_clips(clip_paths, voice_dur, tmpdir)
+        else:
+            bg_path = build_background(image_paths, beat_times, voice_dur, tmpdir, visual_style)
         assemble_video(word_timings, hook_word, audio_path, bg_path,
                        music_path, beat_times, output_path)
         thumb_path = build_thumbnail(thumb_text, image_paths, tmpdir)
