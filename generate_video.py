@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Dead Men's Secrets — YouTube Shorts Agent V11
+20th Century Dark — YouTube Shorts Agent V11
 
 A self-improving autonomous channel. Every component is intentional.
 
@@ -492,7 +492,7 @@ def analyze_performance(data):
     top_str = "\n".join(f"- \"{v['title']}\" — {v['views']} views, {v['avg_watch']:.0f}s avg" for v in top5)
     bot_str = "\n".join(f"- \"{v['title']}\" — {v['views']} views" for v in bot5) or "n/a"
 
-    analysis = claude(f"""Analytics for Dead Men's Secrets YouTube Shorts:
+    analysis = claude(f"""Analytics for 20th Century Dark YouTube Shorts:
 {len(data)} videos | avg {avg_v:.0f} views | avg {avg_w:.0f}s watch (target: 55s+)
 
 TOP:
@@ -597,13 +597,13 @@ def write_script(topic, research, insights):
     # Pure storytelling. Precise definition of what makes this channel's stories work.
     # No word count pressure. No format constraints. Just the best story.
     print("  Pass 1: story...")
-    story = claude(f"""You are a master narrative writer for a dark history channel called Dead Men's Secrets.
+    story = claude(f"""You are a master narrative writer for a dark history channel called 20th Century Dark.
 
 Topic: "{topic}"
 Research: {research}
 {perf}
 
-Write the definitive version of this story. Every great Dead Men's Secrets story has these qualities:
+Write the definitive version of this story. Every great 20th Century Dark story has these qualities:
 
 1. THE HIDDEN ANGLE — not the famous version of events. The thing that got buried.
    The decision made in a back room. The detail the official record omits.
@@ -1420,7 +1420,7 @@ def assemble_video(word_timings, hook_word, audio_path, bg_path,
         "vignette=PI/3.5",
         f"fade=t=in:st={HOOK_DUR:.2f}:d=0.4",
         # Channel branding — always visible
-        f"drawtext=text='DEAD MEN\u2019S SECRETS'"
+        f"drawtext=text='20TH CENTURY DARK'"
         f":fontfile={FONT}:fontsize=38:fontcolor=#FFD700"
         f":x=(w-text_w)/2:y=88:borderw=3:bordercolor=black@0.95",
         # Hook word — black screen, first 0.5s only
@@ -1530,7 +1530,7 @@ def build_thumbnail(thumb_text, image_paths, tmpdir):
             f":fontcolor=white:x=(w-text_w)/2:y={y}:borderw=6:bordercolor=black",
         ]
     text_filters.append(
-        f"drawtext=text='DEAD MEN\u2019S SECRETS':fontfile={FONT}:fontsize=42"
+        f"drawtext=text='20TH CENTURY DARK':fontfile={FONT}:fontsize=42"
         f":fontcolor=#FFD700:x=(w-text_w)/2:y=28:borderw=3:bordercolor=black"
     )
     tf = ",".join(text_filters)
@@ -1559,7 +1559,7 @@ def build_thumbnail(thumb_text, image_paths, tmpdir):
 
 def upload_to_youtube(video_path, thumb_path, title, script, tags, token):
     print("Uploading to YouTube...")
-    desc = f"{script}\n\nFollow Dead Men's Secrets — true history buried for a reason.\n\n#" + " #".join(tags)
+    desc = f"{script}\n\nFollow 20th Century Dark — true history buried for a reason.\n\n#" + " #".join(tags)
 
     init = requests.post(
         "https://www.googleapis.com/upload/youtube/v3/videos"
@@ -1616,7 +1616,7 @@ def upload_to_youtube(video_path, thumb_path, title, script, tags, token):
 
 def main():
     now = datetime.datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
-    print(f"\n{'═'*60}\nDead Men's Secrets — {now}\n{'═'*60}\n")
+    print(f"\n{'═'*60}\n20th Century Dark — {now}\n{'═'*60}\n")
 
     with tempfile.TemporaryDirectory() as tmpdir:
         audio_path  = f"{tmpdir}/voice.mp3"
