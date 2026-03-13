@@ -636,24 +636,39 @@ No questions. Statements only. No headers. No formatting. Raw story only.""", ma
     print("  Pass 2: voice...")
     script_raw = claude(f"""You are rewriting a story for a single human voice speaking directly into someone's ear.
 
+The listener has no prior knowledge of this story. They need to understand it on the first listen, even with a robotic voice reading it.
+
 Original story:
 {story}
 
-Rewrite it as a spoken voice script. Target register: calm, measured, authoritative.
-Like someone who has done the research and is quietly devastated by what they found.
-Never sensational. Never breathless. The facts are disturbing enough.
+STRUCTURE — follow this exactly:
+
+SENTENCE 1-2: ORIENTATION (plain English, anyone can follow)
+Tell the listener exactly who the main person is and what world they're in.
+Example: "In 1961, Israel was hunting the man who organized the Holocaust. His name was Adolf Eichmann. He was hiding in Argentina."
+Keep it simple. No assumed knowledge. One fact per sentence.
+
+SENTENCE 3: HOOK
+The most disturbing or surprising fact. Short. Lands like a punch.
+
+SENTENCES 4-8: BUILD
+Each sentence raises stakes. Specific names, dates, numbers.
+Always give context before dropping a name — never assume they know who someone is.
+
+FINAL SENTENCE: THE TWIST
+One sentence. Short. Recontextualizes everything. Devastating.
 
 STRICT RULES — every line must follow these:
 - Maximum 12 words per sentence. Hard limit.
 - One thought per sentence. Never combine two ideas.
-- Spell out every abbreviation. "USS" becomes "the USS" or just "the ship".
-- Never drop a proper noun without context first. Wrong: "Then Smith ordered it." Right: "General Smith ordered the executions."
-- Use "..." for deliberate pauses where the weight needs a moment to land.
+- Spell out every abbreviation. Write "the United States" not "the U.S."
+- Always introduce a person before using their name. "Hans Globke, Hitler's legal advisor" not just "Globke".
+- Use "..." for deliberate pauses where weight needs a moment to land.
 - Contractions always: "he didn't" not "he did not". Sounds human.
 - Active voice always. "He ordered" not "it was ordered by him."
-- Vary sentence length deliberately — short sentences after long ones hit harder.
-- 120-150 words total. Count carefully.
-- Raw script only. No labels. No formatting. No markdown.""", max_tokens=500)
+- Write for a 10th grade reading level. Simple words. Short sentences.
+- 130-160 words total. Count carefully.
+- Raw script only. No labels. No formatting. No markdown.""", max_tokens=600)
 
     # Clean any markdown that crept in
     script = re.sub(r'^#+\s*.*$',     '', script_raw, flags=re.MULTILINE)
@@ -1304,15 +1319,18 @@ def assemble_video(word_timings, hook_word, audio_path, bg_path,
     # Only shrink when chunk exceeds 28 chars to handle rare extreme cases.
     for text, t0, t1 in chunks:
         char_count = len(text)
-        if char_count > 28:
-            font_size = max(48, int(70 * 28 / char_count))
+        if char_count > 24:
+            font_size = max(44, int(66 * 24 / char_count))
         else:
-            font_size = 70
+            font_size = 66
+        # x: clamp so text never runs past 48px margin on either side
+        # (w-text_w)/2 centers it; if text_w > w-96 the clamp kicks in
+        x_expr = f"max(48, (w-text_w)/2)"
         filters.append(
             f"drawtext=text='{esc(text)}'"
             f":fontfile={FONT}:fontsize={font_size}:fontcolor=white"
-            f":x=(w-text_w)/2:y={CAPTION_Y}"
-            f":borderw=6:bordercolor=black@0.9"
+            f":x={x_expr}:y={CAPTION_Y}"
+            f":borderw=5:bordercolor=black@0.92"
             f":enable='between(t,{t0:.3f},{t1:.3f})'"
         )
 
@@ -1501,10 +1519,19 @@ def main():
             image_paths  = img_fut.result()
             word_timings = voice_fut.result()
 
-        # Fallback chain: Supabase library → Pexels → dark gradient (in build_background)
-        if not image_paths:
-            print("Replicate failed — trying Supabase image library")
-            image_paths = get_images_from_library(scene_prompts, tmpdir)
+        # Always top up to 6 images — mix Replicate successes with library matches
+        # This means even if Replicate rate-limits 5/6, we still get 6 distinct scenes
+        target = len(scene_prompts)
+        if len(image_paths) < target:
+            needed = target - len(image_paths)
+            print(f"Replicate got {len(image_paths)}/{target} — pulling {needed} from library")
+            lib_imgs = get_images_from_library(scene_prompts, tmpdir)
+            # Add library images that aren't already in image_paths
+            for lp in lib_imgs:
+                if len(image_paths) >= target:
+                    break
+                if lp not in image_paths:
+                    image_paths.append(lp)
         if not image_paths:
             print("Library empty — trying Pexels")
             image_paths = fetch_pexels_fallback(scene_prompts, tmpdir)
