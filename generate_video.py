@@ -1508,6 +1508,11 @@ def assemble_video(word_timings, hook_word, audio_path, bg_path,
 
     vf = ",".join(filters)
 
+    # Write filter to file — avoids command line length limit with many captions
+    vf_file = f"{os.path.dirname(output_path)}/vf.txt"
+    with open(vf_file, "w") as f:
+        f.write(vf)
+
     if music_path and os.path.exists(music_path):
         af = (f"[1:a]volume=1.0[voice];"
               f"[2:a]volume=0.08,"
@@ -1516,7 +1521,8 @@ def assemble_video(word_timings, hook_word, audio_path, bg_path,
               f"[voice][music]amix=inputs=2:duration=first[aout]")
         cmd = ["ffmpeg", "-y",
                "-i", bg_path, "-i", audio_path, "-i", music_path,
-               "-filter_complex", af, "-vf", vf,
+               "-filter_complex", af,
+               "-vf", f"file:{vf_file}",
                "-map", "0:v", "-map", "[aout]",
                "-c:v", "libx264", "-preset", "fast", "-crf", "18",
                "-c:a", "aac", "-b:a", "192k",
@@ -1526,7 +1532,7 @@ def assemble_video(word_timings, hook_word, audio_path, bg_path,
     else:
         cmd = ["ffmpeg", "-y",
                "-i", bg_path, "-i", audio_path,
-               "-vf", vf,
+               "-vf", f"file:{vf_file}",
                "-c:v", "libx264", "-preset", "fast", "-crf", "18",
                "-c:a", "aac", "-b:a", "192k",
                "-shortest", "-movflags", "+faststart", "-pix_fmt", "yuv420p",
@@ -1534,13 +1540,29 @@ def assemble_video(word_timings, hook_word, audio_path, bg_path,
 
     r = run(cmd, check=False)
     if r.returncode != 0:
-        print(f"Assembly retry without music: {r.stderr[-100:]}")
-        run(["ffmpeg", "-y", "-i", bg_path, "-i", audio_path,
-             "-vf", vf, "-c:v", "libx264", "-preset", "fast", "-crf", "18",
-             "-c:a", "aac", "-b:a", "192k", "-shortest",
-             "-movflags", "+faststart", "-pix_fmt", "yuv420p", output_path])
+        # Fallback: pass vf directly (may hit limit but worth trying)
+        print(f"Retry with inline vf...")
+        if music_path and os.path.exists(music_path):
+            cmd2 = ["ffmpeg", "-y",
+                    "-i", bg_path, "-i", audio_path, "-i", music_path,
+                    "-filter_complex", af, "-vf", vf,
+                    "-map", "0:v", "-map", "[aout]",
+                    "-c:v", "libx264", "-preset", "fast", "-crf", "18",
+                    "-c:a", "aac", "-b:a", "192k",
+                    "-t", str(total_dur),
+                    "-movflags", "+faststart", "-pix_fmt", "yuv420p", output_path]
+        else:
+            cmd2 = ["ffmpeg", "-y",
+                    "-i", bg_path, "-i", audio_path,
+                    "-vf", vf, "-c:v", "libx264", "-preset", "fast", "-crf", "18",
+                    "-c:a", "aac", "-b:a", "192k", "-shortest",
+                    "-movflags", "+faststart", "-pix_fmt", "yuv420p", output_path]
+        run(cmd2, check=False)
 
-    print(f"Final video: {os.path.getsize(output_path)/1048576:.1f}MB, {total_dur:.1f}s")
+    if os.path.exists(output_path):
+        print(f"Final video: {os.path.getsize(output_path)/1048576:.1f}MB, {total_dur:.1f}s")
+    else:
+        raise RuntimeError("Assembly failed — no output file produced")
 
 def build_thumbnail(thumb_text, image_paths, tmpdir):
     """
