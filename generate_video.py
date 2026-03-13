@@ -538,20 +538,28 @@ def generate_topic(insights):
             if insights.get("has_data")
             else "\nNew channel. Prioritize: named individuals, specific numbers, betrayal, unexpected consequences.")
 
-    topic = claude(f"""You are the creative director of the most disturbing history channel on YouTube.
+    topic = claude(f"""You are the creative director of a dark history channel focused exclusively on 20th century history (1900-1991).
+
+Your niche: the buried stories of the World Wars, the Holocaust, Soviet atrocities, Cold War espionage, political assassinations, CIA/KGB operations, and the cults and mass events that defined the century.
 {perf}
 
 Generate ONE topic. Must be ALL of:
+- Set between 1900 and 1991
 - TRUE and verifiable
-- OBSCURE — most people have never heard this specific story
-- Has a TWIST that recontextualizes everything
+- OBSCURE — the famous version of this story exists, but not THIS specific angle
+- Has a TWIST that recontextualizes everything — someone trusted who shouldn't have been, someone who profited, something covered up
 - VISCERAL — stomach drop or jaw drop
 - HYPER-SPECIFIC — named person, exact date, exact number, exact place
+
+Strong examples of the right kind of topic:
+- The SS officer who saved 1,200 Jews and was later prosecuted by Israel
+- The Soviet scientist ordered to develop a poison with no antidote who secretly documented everything
+- The CIA operative who ran both sides of a Cold War spy exchange for eleven years
 
 Do NOT repeat these recent topics:
 {used_str}
 
-ONE sentence only. No preamble. No explanation.""", max_tokens=120)
+ONE sentence only. No preamble. No explanation.""", max_tokens=150)
 
     save_topic(topic)
     print(f"Topic: {topic}")
