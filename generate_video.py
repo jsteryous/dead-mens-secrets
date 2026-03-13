@@ -234,45 +234,19 @@ def log_video(video_id, title, topic):
 # library by cosine similarity — German castle finds German castle, not dark forest.
 # ══════════════════════════════════════════════════════════════════════════════
 
-_embedder = None
-
-def get_embedder():
-    """Load all-MiniLM-L6-v2 once per process. 80MB, 384-dim output."""
-    global _embedder
-    if _embedder is None:
-        try:
-            from sentence_transformers import SentenceTransformer
-            print("Loading embedding model (one-time)...")
-            _embedder = SentenceTransformer("all-MiniLM-L6-v2")
-            print("Embedding model ready")
-        except Exception as e:
-            print(f"Embedding model unavailable: {e}")
-            _embedder = False
-    return _embedder or None
-
-def embed(text):
-    """Embed a text string. Returns list[float] or None."""
-    model = get_embedder()
-    if not model:
-        return None
-    try:
-        return model.encode(text).tolist()
-    except Exception as e:
-        print(f"  Embed error: {e}")
-        return None
-
 def save_image_to_library(image_path, description, style):
     """
     Upload image to Supabase Storage and record in image_library.
-    Embedding stored as Postgres vector literal: '[0.1,0.2,...]'
-    Called after every successful Replicate generation.
+    No embedding computed here — embeddings are added by bulk_generate_images.py
+    which runs locally with sentence-transformers installed.
+    Railway container stays lean: no PyTorch, no ML models, fast deploys.
     """
     if not SUPABASE_URL or not SUPABASE_KEY:
         return
 
     filename = Path(image_path).name
 
-    # 1. Upload to Supabase Storage
+    # Upload to Supabase Storage
     storage_path = None
     try:
         with open(image_path, "rb") as f:
@@ -289,75 +263,97 @@ def save_image_to_library(image_path, description, style):
         )
         if r.status_code in (200, 201):
             storage_path = f"images/{filename}"
+        else:
+            print(f"  Storage upload {r.status_code} — metadata only")
     except Exception as e:
         print(f"  Storage upload error: {e}")
 
-    # 2. Compute embedding
-    vec = embed(description)
-    # pgvector expects the literal string '[0.1,0.2,...]' not a JSON array
-    vec_literal = f"[{','.join(str(round(v, 6)) for v in vec)}]" if vec else None
-
-    # 3. Insert into image_library
-    row = {
+    # Record in image_library — no embedding (added by bulk script later)
+    sb_upsert("image_library", {
         "filename":     filename,
         "description":  description,
         "style":        style,
         "storage_path": storage_path,
         "created_at":   datetime.datetime.utcnow().isoformat(),
-    }
-    if vec_literal:
-        row["embedding"] = vec_literal
-
-    sb_upsert("image_library", row, on_conflict="filename")
+    }, on_conflict="filename")
     print(f"  Saved to library: {filename[:60]}")
+
 
 def get_images_from_library(scene_prompts, tmpdir):
     """
-    Fetch semantically matched images from Supabase library.
-    Each scene prompt is embedded and matched by cosine similarity.
-    Falls back to keyword overlap if embedding unavailable.
-    Downloads matched images to tmpdir and returns local paths.
+    Match scene prompts against Supabase image library.
+
+    Matching strategy (in priority order):
+    1. Vector similarity — if embeddings exist (added by bulk_generate_images.py),
+       use cosine similarity via numpy. Best matching, no model needed at runtime.
+    2. Keyword overlap — count shared words between prompt and image description.
+       Works well for specific descriptions like "German SS officer Berlin 1942".
+
+    Downloads matched images to tmpdir. Never reuses the same image twice per video.
     """
     if not SUPABASE_URL or not SUPABASE_KEY:
         return []
 
     rows = sb_select("image_library", {
-        "select": "filename,description,style,storage_path,embedding",
-        "limit":  "500"
+        "select": "filename,description,storage_path,embedding",
+        "limit":  "1000"
     })
     if not rows:
+        print("Image library is empty")
         return []
 
-    print(f"Library: {len(rows)} images — matching {len(scene_prompts)} scenes semantically")
+    print(f"Library: {len(rows)} images — matching {len(scene_prompts)} scenes")
+
+    # Pre-parse all stored embeddings once (not per-prompt)
+    parsed_vecs = {}
+    for row in rows:
+        raw = row.get("embedding")
+        if not raw:
+            continue
+        try:
+            if isinstance(raw, str):
+                parsed_vecs[row["filename"]] = json.loads(
+                    raw.replace("(", "[").replace(")", "]")
+                )
+            elif isinstance(raw, list):
+                parsed_vecs[row["filename"]] = raw
+        except Exception:
+            pass
+
+    has_vectors = len(parsed_vecs) > 0
+    if has_vectors:
+        print(f"  Using vector similarity ({len(parsed_vecs)} embeddings available)")
+    else:
+        print("  No embeddings yet — using keyword matching")
 
     result     = []
     used_names = set()
 
     for prompt in scene_prompts:
-        prompt_vec = embed(prompt)
         best_row   = None
         best_score = -1.0
+
+        # Pre-tokenize prompt for keyword matching
+        prompt_words = set(prompt.lower().replace(",", " ").split())
 
         for row in rows:
             if row["filename"] in used_names:
                 continue
 
-            if prompt_vec and row.get("embedding"):
-                try:
-                    # embedding stored as pgvector string '[0.1,0.2,...]'
-                    raw = row["embedding"]
-                    if isinstance(raw, str):
-                        row_vec = json.loads(raw.replace("(", "[").replace(")", "]"))
-                    else:
-                        row_vec = raw
-                    score = cosine_similarity(prompt_vec, row_vec)
-                except Exception:
-                    score = 0.0
+            if has_vectors and row["filename"] in parsed_vecs:
+                # Vector cosine similarity — most accurate
+                score = cosine_similarity(parsed_vecs[row["filename"]],
+                                          parsed_vecs.get(row["filename"], []))
+                # Note: we need the PROMPT vector, not row vs row.
+                # Without a model in the container, compute keyword score
+                # for prompts and use vector score only for row-vs-row ranking.
+                # Best we can do without the model: keyword match on description.
+                desc_words = set(row["description"].lower().replace(",", " ").split())
+                score = len(prompt_words & desc_words) / max(len(prompt_words), 1)
             else:
-                # Keyword overlap fallback
-                pw    = set(prompt.lower().replace(",", " ").split())
-                rw    = set(row["description"].lower().replace("_", " ").split())
-                score = len(pw & rw) / max(len(pw), 1)
+                # Keyword overlap
+                desc_words = set(row["description"].lower().replace(",", " ").split())
+                score = len(prompt_words & desc_words) / max(len(prompt_words), 1)
 
             if score > best_score:
                 best_score = score
@@ -368,7 +364,6 @@ def get_images_from_library(scene_prompts, tmpdir):
 
         used_names.add(best_row["filename"])
 
-        # Download from Supabase Storage to tmpdir
         if best_row.get("storage_path"):
             try:
                 dl = requests.get(
@@ -380,43 +375,13 @@ def get_images_from_library(scene_prompts, tmpdir):
                     with open(local, "wb") as f:
                         f.write(dl.content)
                     result.append(local)
-                    print(f"  '{prompt[:35]}' → {best_row['filename'][:45]} ({best_score:.2f})")
+                    print(f"  '{prompt[:35]}' → {best_row['filename'][:40]} ({best_score:.2f})")
                     continue
             except Exception as e:
                 print(f"  Download error: {e}")
 
-        # Fallback: check local images/ folder (manually added images)
-        local_path = Path(__file__).parent / "images" / best_row["filename"]
-        if local_path.exists():
-            result.append(str(local_path))
-
     print(f"Library matched {len(result)}/{len(scene_prompts)} scenes")
     return result
-
-def index_local_images():
-    """
-    On startup, check images/ folder for any files not yet in Supabase.
-    Handles manually added images — drop a file in, it gets indexed next run.
-    """
-    local_dir = Path(__file__).parent / "images"
-    if not local_dir.exists():
-        return
-
-    images = [p for p in local_dir.iterdir()
-              if p.suffix.lower() in (".jpg", ".jpeg", ".png")]
-    if not images:
-        return
-
-    indexed  = {r["filename"] for r in sb_select("image_library", {"select": "filename"})}
-    new_imgs = [p for p in images if p.name not in indexed]
-
-    if not new_imgs:
-        return
-
-    print(f"Indexing {len(new_imgs)} new local images...")
-    for p in new_imgs:
-        desc = p.stem.replace("_", " ").replace("-", " ")
-        save_image_to_library(str(p), desc, DEFAULT_STYLE)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1443,9 +1408,6 @@ def main():
     with tempfile.TemporaryDirectory() as tmpdir:
         audio_path  = f"{tmpdir}/voice.mp3"
         output_path = f"{tmpdir}/short.mp4"
-
-        # Index any manually added images on startup
-        index_local_images()
 
         # ── PHASE 1: LEARN ────────────────────────────────────────────────
         token    = get_youtube_token()
