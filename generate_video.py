@@ -52,7 +52,7 @@ SUPABASE_KEY          = os.environ.get("SUPABASE_KEY")
 
 # ── VIDEO CONSTANTS ───────────────────────────────────────────────────────────
 FONT      = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
-W, H      = 1080, 1920          # 9:16 portrait
+W, H      = 720, 1280           # 9:16 portrait — lower res for Railway memory
 CAPTION_Y = int(H * 0.72)       # lower third caption position
 HOOK_DUR  = 0.55                 # black screen + hook word duration (seconds)
 
