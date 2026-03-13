@@ -92,12 +92,10 @@ def esc(s):
             .replace("%",  "\\%")
             .replace("\n", " "))
 
-def run(cmd, check=True):
-    """Run a shell command. Raises on failure if check=True."""
-    r = subprocess.run(cmd, capture_output=True, text=True)
-    if check and r.returncode != 0:
-        raise RuntimeError(f"Command failed: {' '.join(str(c) for c in cmd[:4])}\n{r.stderr[-600:]}")
-    return r
+def run(cmd, check=False):
+    """Run a shell command. Never raises — always returns result."""
+    return subprocess.run(cmd, capture_output=True, text=True)
+
 
 def get_duration(path):
     """Get media file duration in seconds via ffprobe."""
