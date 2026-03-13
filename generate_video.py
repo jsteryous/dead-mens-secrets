@@ -46,9 +46,8 @@ YOUTUBE_CLIENT_ID     = os.environ.get("YOUTUBE_CLIENT_ID")
 YOUTUBE_CLIENT_SECRET = os.environ.get("YOUTUBE_CLIENT_SECRET")
 YOUTUBE_REFRESH_TOKEN = os.environ.get("YOUTUBE_REFRESH_TOKEN")
 
-USED_TOPICS_FILE = Path(__file__).parent / "used_topics.json"
-PERFORMANCE_FILE = Path(__file__).parent / "performance_log.json"
-INSIGHTS_FILE    = Path(__file__).parent / "channel_insights.json"
+SUPABASE_URL = os.environ.get("SUPABASE_URL")
+SUPABASE_KEY = os.environ.get("SUPABASE_KEY")
 
 FONT      = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
 W, H      = 1080, 1920
@@ -288,41 +287,21 @@ Be specific. Actionable. No fluff.""", max_tokens=600)
         "summary":            analysis[:400]
     }
 
-    INSIGHTS_FILE.write_text(json.dumps(insights, indent=2))
+    save_insights(insights)
     print(f"Top video: \"{top5[0]['title']}\" ({top5[0]['views']} views)")
     return insights
 
 
 def update_performance_log(video_id, title, topic, analytics_data):
-    log = []
-    if PERFORMANCE_FILE.exists():
-        try:
-            log = json.loads(PERFORMANCE_FILE.read_text())
-        except:
-            log = []
-    log.append({
-        "video_id":   video_id,
-        "title":      title,
-        "topic":      topic,
-        "posted_at":  datetime.datetime.utcnow().isoformat(),
-    })
-    PERFORMANCE_FILE.write_text(json.dumps(log[-200:], indent=2))
+    """Log a posted video to Supabase."""
+    save_performance_log(video_id, title, topic)
 
-
-# ══════════════════════════════════════════════════════════════════════════════
-# PHASE 2: CONTENT ENGINE
-# ══════════════════════════════════════════════════════════════════════════════
 
 def generate_topic(insights):
     print("Generating topic...")
 
-    used = []
-    if USED_TOPICS_FILE.exists():
-        try:
-            used = json.loads(USED_TOPICS_FILE.read_text())
-        except:
-            used = []
-    used_str = "\n".join(f"- {t}" for t in used[-60:]) or "None yet"
+    used     = get_used_topics()
+    used_str = "\n".join(f"- {t}" for t in used[:60]) or "None yet"
 
     perf_ctx = ""
     if insights.get("has_data"):
@@ -353,8 +332,7 @@ Do NOT use: sexual content, minors, modern terrorism glorification.
 
 ONE sentence only. No preamble.""", max_tokens=120)
 
-    used.append(topic)
-    USED_TOPICS_FILE.write_text(json.dumps(used[-120:], indent=2))
+    save_used_topic(topic)
     print(f"Topic: {topic}")
     return topic
 
@@ -569,20 +547,20 @@ def generate_image_replicate(prompt, style, tag, tmpdir, index):
         with open(img_path, "wb") as f:
             f.write(img_r.content)
 
-        # Save to permanent library with descriptive filename
-        LIBRARY_DIR.mkdir(exist_ok=True)
-        ts       = datetime.datetime.utcnow().strftime("%Y%m%d_%H%M%S")
-        # Filename = style + first 8 words of prompt (descriptive, searchable)
+        # Save to Supabase Storage + image_library table
+        ts          = datetime.datetime.utcnow().strftime("%Y%m%d_%H%M%S")
         prompt_slug = "_".join(prompt.lower().replace(",","").replace(".","").split()[:8])
         lib_name    = f"{style}_{prompt_slug}_{ts}.jpg"
-        lib_path    = LIBRARY_DIR / lib_name
-        with open(lib_path, "wb") as f:
+
+        # Write locally first (needed for upload)
+        local_lib = Path(tmpdir) / lib_name
+        with open(local_lib, "wb") as f:
             f.write(img_r.content)
 
-        # Index it immediately for future semantic search
-        embed_image_into_index(str(lib_path), description=f"{prompt}, {style.replace('_',' ')}")
+        description = f"{prompt}, {style.replace('_',' ')}"
+        save_image_to_library(str(local_lib), description, style)
 
-        print(f"  Scene {index+1} generated + indexed: {lib_name[:60]}")
+        print(f"  Scene {index+1} saved to library: {lib_name[:60]}")
         return img_path
 
     except Exception as e:
@@ -621,202 +599,290 @@ def generate_all_images(scene_prompts, image_tags, visual_style, tmpdir):
     return [p for _, p in valid]
 
 
-# ── EMBEDDING-BASED IMAGE LIBRARY ────────────────────────────────────────────
-# Uses sentence-transformers (all-MiniLM-L6-v2, 80MB local model)
-# Embeddings computed once per image, cached in images/index.json
-# Scene prompts embedded at runtime and matched by cosine similarity
-# No API calls. No tokens. Milliseconds per lookup.
+# ══════════════════════════════════════════════════════════════════════════════
+# SUPABASE PERSISTENCE LAYER
+# All state lives here. Nothing written to disk. Survives every redeploy.
+#
+# Tables (auto-created on first run):
+#   used_topics    — topic text, created_at
+#   performance    — video_id, title, topic, views, watch_time, posted_at
+#   insights       — analysis JSON, generated_at
+#   image_library  — filename, description, embedding (vector), style, storage_path
+# ══════════════════════════════════════════════════════════════════════════════
 
-LIBRARY_DIR = Path(__file__).parent / "images"
-INDEX_FILE  = LIBRARY_DIR / "index.json"
+def sb_headers():
+    return {
+        "apikey":        SUPABASE_KEY,
+        "Authorization": f"Bearer {SUPABASE_KEY}",
+        "Content-Type":  "application/json",
+        "Prefer":        "return=minimal"
+    }
+
+def sb_get(table, params=None):
+    """SELECT from Supabase table."""
+    r = requests.get(
+        f"{SUPABASE_URL}/rest/v1/{table}",
+        headers={**sb_headers(), "Prefer": "return=representation"},
+        params=params,
+        timeout=15
+    )
+    if r.status_code == 200:
+        return r.json()
+    print(f"Supabase GET {table} error {r.status_code}: {r.text[:200]}")
+    return []
+
+def sb_insert(table, data):
+    """INSERT into Supabase table."""
+    r = requests.post(
+        f"{SUPABASE_URL}/rest/v1/{table}",
+        headers=sb_headers(),
+        json=data,
+        timeout=15
+    )
+    if r.status_code not in [200, 201]:
+        print(f"Supabase INSERT {table} error {r.status_code}: {r.text[:200]}")
+    return r.status_code in [200, 201]
+
+def sb_upsert(table, data, on_conflict):
+    """UPSERT into Supabase table."""
+    r = requests.post(
+        f"{SUPABASE_URL}/rest/v1/{table}",
+        headers={**sb_headers(), "Prefer": f"resolution=merge-duplicates"},
+        params={"on_conflict": on_conflict},
+        json=data,
+        timeout=15
+    )
+    return r.status_code in [200, 201]
+
+
+# ── TOPICS ────────────────────────────────────────────────────────────────────
+
+def get_used_topics():
+    """Pull last 120 used topics from Supabase."""
+    rows = sb_get("used_topics", {
+        "select":  "topic",
+        "order":   "created_at.desc",
+        "limit":   "120"
+    })
+    return [r["topic"] for r in rows]
+
+def save_used_topic(topic):
+    """Record a topic as used."""
+    sb_insert("used_topics", {
+        "topic":      topic,
+        "created_at": datetime.datetime.utcnow().isoformat()
+    })
+
+
+# ── PERFORMANCE + INSIGHTS ────────────────────────────────────────────────────
+
+def save_performance_log(video_id, title, topic):
+    """Log a posted video."""
+    sb_insert("performance", {
+        "video_id":  video_id,
+        "title":     title,
+        "topic":     topic,
+        "posted_at": datetime.datetime.utcnow().isoformat()
+    })
+
+def save_insights(insights):
+    """Store latest channel insights."""
+    sb_upsert("insights", {
+        "id":           1,
+        "data":         json.dumps(insights),
+        "generated_at": datetime.datetime.utcnow().isoformat()
+    }, on_conflict="id")
+
+
+# ── IMAGE LIBRARY ─────────────────────────────────────────────────────────────
+
+def get_embedding(text):
+    """
+    Get embedding vector for text using sentence-transformers.
+    Falls back gracefully if model unavailable.
+    """
+    try:
+        from sentence_transformers import SentenceTransformer
+        global _embedder
+        if '_embedder' not in globals() or _embedder is None:
+            print("Loading embedding model...")
+            _embedder = SentenceTransformer("all-MiniLM-L6-v2")
+        return _embedder.encode(text).tolist()
+    except Exception as e:
+        print(f"Embedding unavailable: {e}")
+        return None
 
 _embedder = None
 
-def get_embedder():
-    """Load embedding model once, reuse forever."""
-    global _embedder
-    if _embedder is None:
-        try:
-            from sentence_transformers import SentenceTransformer
-            print("Loading embedding model...")
-            _embedder = SentenceTransformer("all-MiniLM-L6-v2")
-            print("Embedding model ready")
-        except Exception as e:
-            print(f"Embedding model unavailable: {e}")
-            _embedder = False
-    return _embedder if _embedder else None
-
-
 def cosine_similarity(a, b):
-    """Pure numpy cosine similarity."""
     import numpy as np
     a, b = np.array(a), np.array(b)
-    denom = (np.linalg.norm(a) * np.linalg.norm(b))
-    if denom == 0:
-        return 0.0
-    return float(np.dot(a, b) / denom)
+    denom = np.linalg.norm(a) * np.linalg.norm(b)
+    return float(np.dot(a, b) / denom) if denom > 0 else 0.0
 
-
-def load_image_index():
-    """Load cached embeddings index."""
-    if INDEX_FILE.exists():
-        try:
-            return json.loads(INDEX_FILE.read_text())
-        except:
-            return {}
-    return {}
-
-
-def save_image_index(index):
-    """Save embeddings index."""
-    try:
-        INDEX_FILE.write_text(json.dumps(index))
-    except Exception as e:
-        print(f"Index save failed: {e}")
-
-
-def embed_image_into_index(image_path, description=None):
+def save_image_to_library(image_path, description, style, storage_path=None):
     """
-    Add a new image to the embedding index.
-    Description defaults to the filename stem (spaces replace underscores).
-    Called automatically when Replicate saves a new image.
+    Upload image to Supabase Storage and record in image_library table.
+    Called every time Replicate generates a new image.
     """
-    model = get_embedder()
-    if not model:
+    if not SUPABASE_URL or not SUPABASE_KEY:
         return
 
     path     = Path(image_path)
-    text     = description or path.stem.replace("_", " ").replace("-", " ")
-    index    = load_image_index()
     filename = path.name
 
-    if filename in index:
-        return  # already indexed
-
+    # Upload to Supabase Storage
     try:
-        embedding = model.encode(text).tolist()
-        index[filename] = {"embedding": embedding, "description": text}
-        save_image_index(index)
+        with open(image_path, "rb") as f:
+            img_data = f.read()
+
+        storage_r = requests.post(
+            f"{SUPABASE_URL}/storage/v1/object/images/{filename}",
+            headers={
+                "apikey":        SUPABASE_KEY,
+                "Authorization": f"Bearer {SUPABASE_KEY}",
+                "Content-Type":  "image/jpeg",
+            },
+            data=img_data,
+            timeout=30
+        )
+        if storage_r.status_code in [200, 201]:
+            storage_path = f"images/{filename}"
+            print(f"  Uploaded to Supabase Storage: {filename}")
+        else:
+            print(f"  Storage upload failed ({storage_r.status_code}) — metadata only")
+            storage_path = None
     except Exception as e:
-        print(f"  Embedding failed for {filename}: {e}")
+        print(f"  Storage upload error: {e}")
+        storage_path = None
 
+    # Get embedding for semantic search
+    embedding = get_embedding(description)
 
-def rebuild_index_if_needed():
-    """
-    Index any images in the library that aren't yet embedded.
-    Runs at startup — handles images added manually to the folder.
-    """
-    if not LIBRARY_DIR.exists():
-        return
+    # Record in image_library table
+    record = {
+        "filename":     filename,
+        "description":  description,
+        "style":        style,
+        "storage_path": storage_path,
+        "created_at":   datetime.datetime.utcnow().isoformat()
+    }
+    if embedding:
+        record["embedding"] = json.dumps(embedding)
 
-    model = get_embedder()
-    if not model:
-        return
-
-    all_images = (list(LIBRARY_DIR.glob("*.jpg")) +
-                  list(LIBRARY_DIR.glob("*.jpeg")) +
-                  list(LIBRARY_DIR.glob("*.png")))
-    index      = load_image_index()
-    new_count  = 0
-
-    for img_path in all_images:
-        if img_path.name not in index and img_path.name != "index.json":
-            text = img_path.stem.replace("_", " ").replace("-", " ")
-            try:
-                embedding = model.encode(text).tolist()
-                index[img_path.name] = {"embedding": embedding, "description": text}
-                new_count += 1
-            except:
-                pass
-
-    if new_count > 0:
-        save_image_index(index)
-        print(f"Index: added {new_count} new images ({len(index)} total)")
+    sb_upsert("image_library", record, on_conflict="filename")
 
 
 def get_local_images_for_scenes(scene_prompts, visual_style):
     """
-    Semantic image matching using embeddings.
-    Each scene prompt is embedded and matched against the library index.
-    Returns best unique match per scene — never reuses an image.
-    Falls back to filename keyword match if model unavailable.
+    Semantic image matching against Supabase image library.
+    Embeds each scene prompt and finds closest match by cosine similarity.
+    Falls back to keyword match if embeddings unavailable.
+    Returns list of local temp paths (downloads from Supabase Storage).
     """
-    if not LIBRARY_DIR.exists():
+    if not SUPABASE_URL or not SUPABASE_KEY:
         return []
 
-    all_images = (list(LIBRARY_DIR.glob("*.jpg")) +
-                  list(LIBRARY_DIR.glob("*.jpeg")) +
-                  list(LIBRARY_DIR.glob("*.png")))
-    # Filter out index file
-    all_images = [p for p in all_images if p.suffix in (".jpg", ".jpeg", ".png")]
+    # Fetch all images from library
+    rows = sb_get("image_library", {
+        "select": "filename,description,style,storage_path,embedding",
+        "limit":  "500"
+    })
 
-    if not all_images:
-        print("Local library is empty")
+    if not rows:
+        print("Image library is empty")
         return []
 
-    print(f"Library: {len(all_images)} images — semantic matching {len(scene_prompts)} scenes")
+    print(f"Library: {len(rows)} images — matching {len(scene_prompts)} scenes")
 
-    # Try embedding-based matching first
-    model = get_embedder()
-    index = load_image_index()
-
-    if model and index:
-        try:
-            import numpy as np
-            result     = []
-            used_names = set()
-
-            for prompt in scene_prompts:
-                prompt_emb = model.encode(prompt).tolist()
-                best_score = -1
-                best_path  = None
-
-                for img_path in all_images:
-                    if img_path.name in used_names:
-                        continue
-                    entry = index.get(img_path.name)
-                    if not entry:
-                        continue
-                    score = cosine_similarity(prompt_emb, entry["embedding"])
-                    if score > best_score:
-                        best_score = score
-                        best_path  = img_path
-
-                if best_path:
-                    result.append(str(best_path))
-                    used_names.add(best_path.name)
-                    print(f"  Scene match: '{prompt[:40]}...' → {best_path.name} ({best_score:.2f})")
-
-            if result:
-                return result
-        except Exception as e:
-            print(f"Embedding match failed: {e} — falling back to keyword match")
-
-    # Fallback: keyword matching from filename
-    print("Using keyword fallback matching")
     result     = []
     used_names = set()
+    tmpdir     = tempfile.mkdtemp()
 
     for prompt in scene_prompts:
-        prompt_words = set(prompt.lower().replace(",", " ").split())
-        best_score   = -1
-        best_path    = None
+        best_row   = None
+        best_score = -1
 
-        for img_path in all_images:
-            if img_path.name in used_names:
+        # Try embedding similarity first
+        prompt_emb = get_embedding(prompt)
+
+        for row in rows:
+            if row["filename"] in used_names:
                 continue
-            name_words = set(img_path.stem.lower().replace("_", " ").replace("-", " ").split())
-            score      = len(prompt_words & name_words)
+
+            if prompt_emb and row.get("embedding"):
+                try:
+                    row_emb = json.loads(row["embedding"])
+                    score   = cosine_similarity(prompt_emb, row_emb)
+                except:
+                    score = 0
+            else:
+                # Keyword fallback
+                pw = set(prompt.lower().replace(",", " ").split())
+                rw = set(row["description"].lower().replace("_", " ").split())
+                score = len(pw & rw) / max(len(pw), 1)
+
             if score > best_score:
                 best_score = score
-                best_path  = img_path
+                best_row   = row
 
-        if best_path:
-            result.append(str(best_path))
-            used_names.add(best_path.name)
+        if not best_row:
+            continue
 
-    print(f"Keyword matched {len(result)}/{len(scene_prompts)} scenes")
+        used_names.add(best_row["filename"])
+
+        # Download image from Supabase Storage
+        if best_row.get("storage_path"):
+            try:
+                dl = requests.get(
+                    f"{SUPABASE_URL}/storage/v1/object/public/{best_row['storage_path']}",
+                    timeout=20
+                )
+                if dl.status_code == 200:
+                    local_path = f"{tmpdir}/{best_row['filename']}"
+                    with open(local_path, "wb") as f:
+                        f.write(dl.content)
+                    result.append(local_path)
+                    print(f"  Matched: '{prompt[:35]}...' → {best_row['filename'][:40]} ({best_score:.2f})")
+                    continue
+            except Exception as e:
+                print(f"  Download failed: {e}")
+
+        # Fallback: check local images/ folder
+        local_check = Path(__file__).parent / "images" / best_row["filename"]
+        if local_check.exists():
+            result.append(str(local_check))
+
+    print(f"Semantic match: {len(result)}/{len(scene_prompts)} scenes")
     return result
+
+
+def rebuild_index_if_needed():
+    """
+    Index any images in local images/ folder not yet in Supabase.
+    Handles manually added images.
+    """
+    local_dir = Path(__file__).parent / "images"
+    if not local_dir.exists():
+        return
+
+    images = [p for p in local_dir.glob("*")
+              if p.suffix.lower() in (".jpg", ".jpeg", ".png")]
+    if not images:
+        return
+
+    # Check which are already in library
+    rows     = sb_get("image_library", {"select": "filename"})
+    indexed  = {r["filename"] for r in rows}
+    new_imgs = [p for p in images if p.name not in indexed]
+
+    if not new_imgs:
+        return
+
+    print(f"Indexing {len(new_imgs)} new local images into Supabase...")
+    for img_path in new_imgs:
+        description = img_path.stem.replace("_", " ").replace("-", " ")
+        save_image_to_library(str(img_path), description, DEFAULT_STYLE)
 
 
 def fetch_pexels_fallback(scene_prompts, tmpdir):
