@@ -569,20 +569,21 @@ def generate_image_replicate(prompt, style, tag, tmpdir, index):
         with open(img_path, "wb") as f:
             f.write(img_r.content)
 
-        # Also save to permanent library with semantic tag
-        tag = tag if tag else "mood_dark"
-        library_dir = Path(__file__).parent / "images"
-        library_dir.mkdir(exist_ok=True)
+        # Save to permanent library with descriptive filename
+        LIBRARY_DIR.mkdir(exist_ok=True)
         ts       = datetime.datetime.utcnow().strftime("%Y%m%d_%H%M%S")
-        lib_name = f"{style}_{tag}_{ts}_{index}.jpg"
-        lib_path = library_dir / lib_name
+        # Filename = style + first 8 words of prompt (descriptive, searchable)
+        prompt_slug = "_".join(prompt.lower().replace(",","").replace(".","").split()[:8])
+        lib_name    = f"{style}_{prompt_slug}_{ts}.jpg"
+        lib_path    = LIBRARY_DIR / lib_name
         with open(lib_path, "wb") as f:
             f.write(img_r.content)
 
-        print(f"  Scene {index+1} generated + saved to library: {len(img_r.content)//1024}KB")
-        return img_path
+        # Index it immediately for future semantic search
+        embed_image_into_index(str(lib_path), description=f"{prompt}, {style.replace('_',' ')}")
 
-        return None
+        print(f"  Scene {index+1} generated + indexed: {lib_name[:60]}")
+        return img_path
 
     except Exception as e:
         print(f"  Image {index} error: {e}")
@@ -620,70 +621,201 @@ def generate_all_images(scene_prompts, image_tags, visual_style, tmpdir):
     return [p for _, p in valid]
 
 
-def get_library_images_for_scene(tag, visual_style, used_paths=None):
+# ── EMBEDDING-BASED IMAGE LIBRARY ────────────────────────────────────────────
+# Uses sentence-transformers (all-MiniLM-L6-v2, 80MB local model)
+# Embeddings computed once per image, cached in images/index.json
+# Scene prompts embedded at runtime and matched by cosine similarity
+# No API calls. No tokens. Milliseconds per lookup.
+
+LIBRARY_DIR = Path(__file__).parent / "images"
+INDEX_FILE  = LIBRARY_DIR / "index.json"
+
+_embedder = None
+
+def get_embedder():
+    """Load embedding model once, reuse forever."""
+    global _embedder
+    if _embedder is None:
+        try:
+            from sentence_transformers import SentenceTransformer
+            print("Loading embedding model...")
+            _embedder = SentenceTransformer("all-MiniLM-L6-v2")
+            print("Embedding model ready")
+        except Exception as e:
+            print(f"Embedding model unavailable: {e}")
+            _embedder = False
+    return _embedder if _embedder else None
+
+
+def cosine_similarity(a, b):
+    """Pure numpy cosine similarity."""
+    import numpy as np
+    a, b = np.array(a), np.array(b)
+    denom = (np.linalg.norm(a) * np.linalg.norm(b))
+    if denom == 0:
+        return 0.0
+    return float(np.dot(a, b) / denom)
+
+
+def load_image_index():
+    """Load cached embeddings index."""
+    if INDEX_FILE.exists():
+        try:
+            return json.loads(INDEX_FILE.read_text())
+        except:
+            return {}
+    return {}
+
+
+def save_image_index(index):
+    """Save embeddings index."""
+    try:
+        INDEX_FILE.write_text(json.dumps(index))
+    except Exception as e:
+        print(f"Index save failed: {e}")
+
+
+def embed_image_into_index(image_path, description=None):
     """
-    Find the best matching image from the local library for a given scene tag.
-    Matching priority:
-      1. Same style + same tag
-      2. Same tag, any style  
-      3. Same style, any tag
-      4. Any image in library
-    Never reuses an image already picked for this video.
+    Add a new image to the embedding index.
+    Description defaults to the filename stem (spaces replace underscores).
+    Called automatically when Replicate saves a new image.
     """
-    library_dir = Path(__file__).parent / "images"
-    if not library_dir.exists():
-        return None
+    model = get_embedder()
+    if not model:
+        return
 
-    all_images = (list(library_dir.glob("*.jpg")) +
-                  list(library_dir.glob("*.jpeg")) +
-                  list(library_dir.glob("*.png")))
-    if not all_images:
-        return None
+    path     = Path(image_path)
+    text     = description or path.stem.replace("_", " ").replace("-", " ")
+    index    = load_image_index()
+    filename = path.name
 
-    used = set(used_paths or [])
-    available = [p for p in all_images if str(p) not in used]
-    if not available:
-        available = all_images  # reuse if library exhausted
+    if filename in index:
+        return  # already indexed
 
-    def score(path):
-        name = path.stem.lower()
-        s = 0
-        if visual_style and visual_style in name: s += 10
-        if tag and tag in name: s += 5
-        return s
-
-    available.sort(key=score, reverse=True)
-    best = available[0]
-    return str(best)
+    try:
+        embedding = model.encode(text).tolist()
+        index[filename] = {"embedding": embedding, "description": text}
+        save_image_index(index)
+    except Exception as e:
+        print(f"  Embedding failed for {filename}: {e}")
 
 
-def get_local_images_for_scenes(scene_tags, visual_style):
+def rebuild_index_if_needed():
     """
-    Get matched library images for all scenes.
-    Returns list of image paths, one per scene, semantically matched.
+    Index any images in the library that aren't yet embedded.
+    Runs at startup — handles images added manually to the folder.
     """
-    library_dir = Path(__file__).parent / "images"
-    if not library_dir.exists():
+    if not LIBRARY_DIR.exists():
+        return
+
+    model = get_embedder()
+    if not model:
+        return
+
+    all_images = (list(LIBRARY_DIR.glob("*.jpg")) +
+                  list(LIBRARY_DIR.glob("*.jpeg")) +
+                  list(LIBRARY_DIR.glob("*.png")))
+    index      = load_image_index()
+    new_count  = 0
+
+    for img_path in all_images:
+        if img_path.name not in index and img_path.name != "index.json":
+            text = img_path.stem.replace("_", " ").replace("-", " ")
+            try:
+                embedding = model.encode(text).tolist()
+                index[img_path.name] = {"embedding": embedding, "description": text}
+                new_count += 1
+            except:
+                pass
+
+    if new_count > 0:
+        save_image_index(index)
+        print(f"Index: added {new_count} new images ({len(index)} total)")
+
+
+def get_local_images_for_scenes(scene_prompts, visual_style):
+    """
+    Semantic image matching using embeddings.
+    Each scene prompt is embedded and matched against the library index.
+    Returns best unique match per scene — never reuses an image.
+    Falls back to filename keyword match if model unavailable.
+    """
+    if not LIBRARY_DIR.exists():
         return []
 
-    all_images = (list(library_dir.glob("*.jpg")) +
-                  list(library_dir.glob("*.jpeg")) +
-                  list(library_dir.glob("*.png")))
+    all_images = (list(LIBRARY_DIR.glob("*.jpg")) +
+                  list(LIBRARY_DIR.glob("*.jpeg")) +
+                  list(LIBRARY_DIR.glob("*.png")))
+    # Filter out index file
+    all_images = [p for p in all_images if p.suffix in (".jpg", ".jpeg", ".png")]
+
     if not all_images:
         print("Local library is empty")
         return []
 
-    print(f"Local library: {len(all_images)} images — matching {len(scene_tags)} scenes by tag")
-    result    = []
-    used_paths = []
+    print(f"Library: {len(all_images)} images — semantic matching {len(scene_prompts)} scenes")
 
-    for tag in scene_tags:
-        path = get_library_images_for_scene(tag, visual_style, used_paths)
-        if path:
-            result.append(path)
-            used_paths.append(path)
+    # Try embedding-based matching first
+    model = get_embedder()
+    index = load_image_index()
 
-    print(f"Library matched {len(result)}/{len(scene_tags)} scenes")
+    if model and index:
+        try:
+            import numpy as np
+            result     = []
+            used_names = set()
+
+            for prompt in scene_prompts:
+                prompt_emb = model.encode(prompt).tolist()
+                best_score = -1
+                best_path  = None
+
+                for img_path in all_images:
+                    if img_path.name in used_names:
+                        continue
+                    entry = index.get(img_path.name)
+                    if not entry:
+                        continue
+                    score = cosine_similarity(prompt_emb, entry["embedding"])
+                    if score > best_score:
+                        best_score = score
+                        best_path  = img_path
+
+                if best_path:
+                    result.append(str(best_path))
+                    used_names.add(best_path.name)
+                    print(f"  Scene match: '{prompt[:40]}...' → {best_path.name} ({best_score:.2f})")
+
+            if result:
+                return result
+        except Exception as e:
+            print(f"Embedding match failed: {e} — falling back to keyword match")
+
+    # Fallback: keyword matching from filename
+    print("Using keyword fallback matching")
+    result     = []
+    used_names = set()
+
+    for prompt in scene_prompts:
+        prompt_words = set(prompt.lower().replace(",", " ").split())
+        best_score   = -1
+        best_path    = None
+
+        for img_path in all_images:
+            if img_path.name in used_names:
+                continue
+            name_words = set(img_path.stem.lower().replace("_", " ").replace("-", " ").split())
+            score      = len(prompt_words & name_words)
+            if score > best_score:
+                best_score = score
+                best_path  = img_path
+
+        if best_path:
+            result.append(str(best_path))
+            used_names.add(best_path.name)
+
+    print(f"Keyword matched {len(result)}/{len(scene_prompts)} scenes")
     return result
 
 
@@ -1316,6 +1448,9 @@ def main():
         audio_path  = f"{tmpdir}/voice.mp3"
         output_path = f"{tmpdir}/short.mp4"
 
+        # ── STARTUP: INDEX ANY NEW IMAGES IN LIBRARY ─────────────────────
+        rebuild_index_if_needed()
+
         # ── PHASE 1: LEARN ────────────────────────────────────────────────
         token          = get_youtube_token()
         analytics_data = pull_youtube_analytics(token)
@@ -1335,10 +1470,10 @@ def main():
             image_paths  = images_future.result()
             word_timings = voice_future.result()
 
-        # Fallback chain: local library (tag-matched) → Pexels → dark gradient
+        # Fallback chain: local library (embedding-matched) → Pexels → dark gradient
         if not image_paths:
-            print("Replicate failed — trying local image library (tag-matched)")
-            image_paths = get_local_images_for_scenes(image_tags, visual_style)
+            print("Replicate failed — trying local image library (semantic match)")
+            image_paths = get_local_images_for_scenes(scene_prompts, visual_style)
         if not image_paths:
             print("No local library — trying Pexels")
             image_paths = fetch_pexels_fallback(scene_prompts, tmpdir)
