@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Dead Men's Secrets — YouTube Shorts Agent V7
+Dead Men's Secrets — YouTube Shorts Agent V11
 
 A self-improving autonomous channel. Every component is intentional.
 
@@ -16,7 +16,7 @@ Daily pipeline:
   1. Pull YouTube analytics → analyze what's working → inform today's content
   2. Generate topic (never repeats, optimized for retention patterns)
   3. Research pass — emotional arc engineered before writing
-  4. Script pass — spoken-word optimized + per-scene visual prompts + era style
+  4. Three-pass script: story → voice (Lemmino register) → metadata
   5. Generate 6 AI images via Replicate (parallel with voiceover)
      → save each to Supabase Storage + embed into image_library table
   6. Voiceover via ElevenLabs /with-timestamps
@@ -576,59 +576,111 @@ Reason through this story as a master storyteller — before writing a single wo
 8. SHARE TRIGGER: The one thing that makes someone show this to a friend right now.""", max_tokens=600)
 
 def write_script(topic, research, insights):
+    """
+    Three-pass script system:
+    Pass 1 — Story: Pure narrative. Best possible story, no format constraints.
+    Pass 2 — Voice: Rewrite for spoken delivery. Lemmino register — calm, precise, devastating.
+    Pass 3 — Metadata: Extract visual direction, hook word, title, tags.
+    """
     print("Writing script + visual direction...")
-    perf = (f"\nOPTIMIZE FOR: {insights['summary'][:200]}" if insights.get("has_data") else "")
+    perf = (f"\nChannel insights: {insights['summary'][:200]}" if insights.get("has_data") else "")
 
-    raw = claude(f"""Topic: "{topic}"
+    # ── PASS 1: STORY ──────────────────────────────────────────────────────────
+    # Pure storytelling. Precise definition of what makes this channel's stories work.
+    # No word count pressure. No format constraints. Just the best story.
+    print("  Pass 1: story...")
+    story = claude(f"""You are a master narrative writer for a dark history channel called Dead Men's Secrets.
+
+Topic: "{topic}"
 Research: {research}
 {perf}
 
-OUTPUT THE SPOKEN SCRIPT FIRST — raw words only, zero formatting, zero labels, zero markdown.
+Write the definitive version of this story. Every great Dead Men's Secrets story has these qualities:
 
-This will be read aloud. Write for the EAR.
+1. THE HIDDEN ANGLE — not the famous version of events. The thing that got buried.
+   The decision made in a back room. The detail the official record omits.
 
-RULES:
-- Read every sentence aloud in your head before keeping it. If you stumble, rewrite it.
-- Short sentences breathe. Long sentences suffocate. Mix deliberately.
-- Use contractions: "he didn't", "they couldn't", "it wasn't"
-- Active voice always. Never passive.
-- Sentence 1 — HOOK: Drop the listener mid-story. Most disturbing fact. No warmup.
-- Sentences 2-5 — BUILD: Each sentence raises stakes slightly. Specific details.
-- Sentences 6-9 — ESCALATION: The verifiable detail that makes it undeniably real.
-- Final sentence — TWIST: Short. Devastating. Last word closes like a door.
-- 120-140 words MAX. Tighter is better.
-- Statements only. Never questions.
+2. ONE PRECISE HUMAN MOMENT — not "thousands died" but "the last entry in his diary was a grocery list."
+   One specific, verifiable detail so precise it makes the story undeniably real.
+   A name. An exact number. An exact date. A specific room. A specific word spoken.
 
-After the script, on separate lines:
+3. THE BETRAYAL OR IRONY — someone trusted who shouldn't have been.
+   Someone who profited. Something covered up. The gap between the official story and what happened.
 
-HOOK_WORD: [one word shown alone on black screen at start]
-VISUAL_STYLE: [oil_painting | cold_war_photo | daguerreotype | illuminated_manuscript | noir_photograph | renaissance_painting | gritty_documentary]
-SCENES: [5-6 image prompts separated by | — specific person, place, moment, mood per scene]
-BEAT_TIMES: [2-3 cut points as percentages e.g. 25|55|78]
-THUMBNAIL_TEXT: [5-7 words, unbearable curiosity]
-TITLE: [YouTube title, max 70 chars, engineered for clicks]
-TAGS: [10 hashtags separated by |]""", max_tokens=1000)
+4. THE RECONTEXTUALIZATION — a fact revealed near the end that makes the listener
+   reinterpret everything they just heard. The ground shifts.
 
-    # Parse metadata from end of response
-    meta         = {}
-    script_lines = []
-    for line in raw.split("\n"):
-        matched = False
+5. RESTRAINT — never editorialize. Never say "shockingly" or "horrifyingly."
+   State facts plainly. The facts are disturbing enough.
+   Trust the listener to feel it.
+
+Structure:
+- First sentence: the most disturbing fact. No warmup. Drop the listener mid-story.
+- Middle: build through specific details. Each sentence raises stakes slightly.
+- End: one short sentence. The kind that stays with you for days.
+
+No questions. Statements only. No headers. No formatting. Raw story only.""", max_tokens=700)
+
+    # ── PASS 2: VOICE ──────────────────────────────────────────────────────────
+    # Rewrite specifically for a cloned voice reading aloud.
+    # Target register: Lemmino — calm, measured, authoritative, never sensational.
+    # The horror comes from the facts, not the delivery.
+    print("  Pass 2: voice...")
+    script_raw = claude(f"""You are rewriting a story for a single human voice speaking directly into someone's ear.
+
+Original story:
+{story}
+
+Rewrite it as a spoken voice script. Target register: calm, measured, authoritative.
+Like someone who has done the research and is quietly devastated by what they found.
+Never sensational. Never breathless. The facts are disturbing enough.
+
+STRICT RULES — every line must follow these:
+- Maximum 12 words per sentence. Hard limit.
+- One thought per sentence. Never combine two ideas.
+- Spell out every abbreviation. "USS" becomes "the USS" or just "the ship".
+- Never drop a proper noun without context first. Wrong: "Then Smith ordered it." Right: "General Smith ordered the executions."
+- Use "..." for deliberate pauses where the weight needs a moment to land.
+- Contractions always: "he didn't" not "he did not". Sounds human.
+- Active voice always. "He ordered" not "it was ordered by him."
+- Vary sentence length deliberately — short sentences after long ones hit harder.
+- 120-150 words total. Count carefully.
+- Raw script only. No labels. No formatting. No markdown.""", max_tokens=500)
+
+    # Clean any markdown that crept in
+    script = re.sub(r'^#+\s*.*$',     '', script_raw, flags=re.MULTILINE)
+    script = re.sub(r'\*\*.*?\*\*', '', script)
+    script = re.sub(r'^---+$',          '', script, flags=re.MULTILINE)
+    script = script.strip()
+
+    # ── PASS 3: METADATA ───────────────────────────────────────────────────────
+    # Extract visual direction, hook word, title, tags.
+    # Separate call so it never bleeds into the voice script.
+    print("  Pass 3: metadata...")
+    meta_raw = claude(f"""Given this spoken script for a dark history YouTube Short:
+
+"{script}"
+
+Topic: "{topic}"
+
+Output ONLY these fields, exactly as shown:
+
+HOOK_WORD: [single word shown alone on black screen — stops the scroll]
+VISUAL_STYLE: [one of: oil_painting | cold_war_photo | daguerreotype | illuminated_manuscript | noir_photograph | renaissance_painting | gritty_documentary]
+SCENES: [5-6 image generation prompts separated by | — each must be hyper-specific: named person, exact place, exact moment, lighting, era, mood]
+BEAT_TIMES: [2-3 emotional peak moments as percentages e.g. 28|55|80]
+THUMBNAIL_TEXT: [5-7 words — creates unbearable curiosity, makes viewer feel they must watch]
+TITLE: [YouTube title max 70 chars — engineered for clicks, specific, provocative]
+TAGS: [10 relevant hashtags separated by |]""", max_tokens=400)
+
+    # Parse metadata
+    meta = {}
+    for line in meta_raw.split("\n"):
         for key in ("HOOK_WORD:", "VISUAL_STYLE:", "SCENES:", "BEAT_TIMES:",
                     "THUMBNAIL_TEXT:", "TITLE:", "TAGS:"):
             if line.startswith(key):
                 meta[key.rstrip(":")] = line[len(key):].strip()
-                matched = True
                 break
-        if not matched:
-            script_lines.append(line)
-
-    # Strip any markdown Claude snuck into the script
-    script = "\n".join(script_lines).strip()
-    script = re.sub(r'^#+\s*\w.*$',    '', script, flags=re.MULTILINE)
-    script = re.sub(r'^\*\*.*?\*\*\s*', '', script, flags=re.MULTILINE)
-    script = re.sub(r'^---+$',          '', script, flags=re.MULTILINE)
-    script = script.strip()
 
     # Beat times
     beat_times = []
@@ -835,8 +887,12 @@ def generate_voiceover(script, audio_path):
         headers={"xi-api-key": ELEVENLABS_API_KEY, "Content-Type": "application/json"},
         json={"text": script,
               "model_id": "eleven_monolingual_v1",
-              "voice_settings": {"stability": 0.28, "similarity_boost": 0.85,
-                                 "style": 0.52, "use_speaker_boost": True}},
+              "voice_settings": {
+                                 "stability":       0.50,
+                                 "similarity_boost": 0.88,
+                                 "style":           0.15,
+                                 "use_speaker_boost": True
+                             }},
         timeout=60
     )
     if r.status_code != 200:
@@ -1231,11 +1287,22 @@ def assemble_video(word_timings, hook_word, audio_path, bg_path,
         f":enable='between(t,0,{HOOK_DUR-0.05:.2f})'",
     ]
 
-    # Word-synced captions
+    # Word-synced captions — dynamic font size prevents long words overflowing
+    # Base: 70px for normal chunks. Shrinks for long words to guarantee fit.
+    # Max safe width: ~900px (leaving 90px margin each side on 1080px)
+    # At 70px, ~13px per char average → 900/13 = ~69 chars max
+    # Most 3-word chunks are under 20 chars so 70px is always fine.
+    # Edge case: "CZECHOSLOVAKIA ASSASSINATION PLOT" = 38 chars — still fits at 70px.
+    # Only shrink when chunk exceeds 28 chars to handle rare extreme cases.
     for text, t0, t1 in chunks:
+        char_count = len(text)
+        if char_count > 28:
+            font_size = max(48, int(70 * 28 / char_count))
+        else:
+            font_size = 70
         filters.append(
             f"drawtext=text='{esc(text)}'"
-            f":fontfile={FONT}:fontsize=70:fontcolor=white"
+            f":fontfile={FONT}:fontsize={font_size}:fontcolor=white"
             f":x=(w-text_w)/2:y={CAPTION_Y}"
             f":borderw=6:bordercolor=black@0.9"
             f":enable='between(t,{t0:.3f},{t1:.3f})'"
