@@ -351,7 +351,7 @@ def generate_image(description, style, tmpdir, idx):
             headers={
                 "Authorization": f"Bearer {REPLICATE_API_KEY}",
                 "Content-Type":  "application/json",
-                "Prefer":        "wait=90",
+                "Prefer":        "wait=60",
             },
             json={"input": {
                 "prompt":         full_prompt,
