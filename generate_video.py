@@ -1292,117 +1292,33 @@ def build_background_from_clips(clip_paths, voice_dur, tmpdir):
     return bg
 
 
-def get_clip_urls_from_library(scene_prompts):
-    """
-    Get Supabase public URLs for pre-rendered clips — no download needed.
-    FFmpeg streams them directly via HTTP. Zero disk usage, zero download time.
-    Returns list of public URLs matched to scene prompts.
-    """
-    if not SUPABASE_URL or not SUPABASE_KEY:
-        return []
-    try:
-        r = requests.get(
-            f"{SUPABASE_URL}/rest/v1/clip_library"
-            f"?select=filename,description,storage_path"
-            f"&storage_path=not.is.null&limit=500",
-            headers={"apikey": SUPABASE_KEY,
-                     "Authorization": f"Bearer {SUPABASE_KEY}"},
-            timeout=10
-        )
-        rows = r.json() if r.status_code == 200 else []
-    except Exception:
-        return []
-
-    if not rows:
-        return []
-
-    print(f"  Clip library: {len(rows)} clips — matching by keyword")
-    urls = []
-    used = set()
-
-    for prompt in scene_prompts:
-        prompt_words = set(re.sub(r'[^\w\s]', '', prompt).lower().split())
-        best, best_score = None, -1
-        for row in rows:
-            if row["filename"] in used:
-                continue
-            desc_words = set(re.sub(r'[^\w\s]', '', row["description"]).lower().split())
-            score = len(prompt_words & desc_words)
-            if score > best_score:
-                best_score, best = score, row
-        if best:
-            used.add(best["filename"])
-            url = f"{SUPABASE_URL}/storage/v1/object/public/{best['storage_path']}"
-            urls.append(url)
-            print(f"  Clip: {best['filename'][:50]} ({best_score})")
-
-    return urls
-
-
 def build_background(image_paths, beat_times, voice_dur, tmpdir, visual_style=DEFAULT_STYLE):
-    """
-    Build background video.
-    Priority 1: Pre-rendered clips streamed via HTTP URLs (fast, no download)
-    Priority 2: Still images from Replicate (cycle if few)
-    Priority 3: Dark gradient fallback
-    """
+    """Dead simple background — scale images, concat, done. Never crashes."""
     print("Building background...")
     bg = f"{tmpdir}/bg.mp4"
 
-    # ── Priority 1: Pre-rendered clips via HTTP ───────────────────────────────
-    # FFmpeg reads directly from Supabase URLs — no download, no disk usage
-    clip_urls = get_clip_urls_from_library(
-        [f"scene {i}" for i in range(len(image_paths or []))]
-        if not image_paths else
-        [f"scene {i}" for i in range(6)]
-    )
-
-    if clip_urls:
-        print(f"  Streaming {len(clip_urls)} clips via HTTP...")
-        # Write URL list for ffmpeg concat
-        lst = f"{tmpdir}/clips.txt"
-        with open(lst, "w") as f:
-            # Cycle clips to cover full duration
-            all_urls = (clip_urls * (int(voice_dur // 5) + 2))
-            for url in all_urls:
-                f.write(f"file '{url}'\n")
-        r = run(
-            ["ffmpeg", "-y", "-f", "concat", "-safe", "0",
-             "-protocol_whitelist", "file,http,https,tcp,tls,crypto",
-             "-i", lst,
-             "-t", str(voice_dur),
-             "-vf", f"scale={W}:{H}:force_original_aspect_ratio=increase,crop={W}:{H}",
-             "-c:v", "libx264", "-preset", "ultrafast", "-crf", "23",
-             "-pix_fmt", "yuv420p", bg],
-            check=False
-        )
-        if r.returncode == 0 and os.path.exists(bg):
-            print(f"  Background from clips: {voice_dur:.1f}s")
-            return bg
-        print("  Clip stream failed — falling back to images")
-
-    # ── Priority 2: Still images ──────────────────────────────────────────────
+    # No images — dark gradient
     if not image_paths:
-        run(["ffmpeg", "-y", "-f", "lavfi",
+        subprocess.run(["ffmpeg", "-y", "-f", "lavfi",
              "-i", f"color=c=0x08080f:size={W}x{H}:duration={voice_dur}:rate=30",
              "-c:v", "libx264", "-preset", "ultrafast", "-crf", "28",
-             "-pix_fmt", "yuv420p", bg], check=False)
+             "-pix_fmt", "yuv420p", bg],
+            capture_output=True, check=False)
         return bg
 
     dur_each = voice_dur / len(image_paths)
-    clips    = []
-
+    clips = []
     for i, img in enumerate(image_paths):
         out = f"{tmpdir}/img_{i}.mp4"
-        r = run(
+        subprocess.run(
             ["ffmpeg", "-y", "-loop", "1", "-i", img,
              "-t", str(dur_each + 0.1),
              "-vf", f"scale={W}:{H}:force_original_aspect_ratio=increase,crop={W}:{H}",
              "-c:v", "libx264", "-preset", "ultrafast", "-crf", "23",
              "-pix_fmt", "yuv420p", "-an", out],
-            check=False
+            capture_output=True, check=False
         )
-        if r.returncode == 0 and os.path.exists(out):
+        if os.path.exists(out):
             clips.append(out)
 
     if not clips:
@@ -1413,15 +1329,15 @@ def build_background(image_paths, beat_times, voice_dur, tmpdir, visual_style=DE
         for c in clips:
             f.write(f"file '{c}'\n")
 
-    r = run(
+    subprocess.run(
         ["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", lst,
          "-t", str(voice_dur),
          "-c:v", "libx264", "-preset", "ultrafast", "-crf", "23",
          "-pix_fmt", "yuv420p", bg],
-        check=False
+        capture_output=True, check=False
     )
 
-    if r.returncode != 0 or not os.path.exists(bg):
+    if not os.path.exists(bg):
         return build_background([], beat_times, voice_dur, tmpdir)
 
     print(f"  Background: {len(clips)} images, {voice_dur:.1f}s")
