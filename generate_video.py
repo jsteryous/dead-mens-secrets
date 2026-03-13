@@ -1610,19 +1610,11 @@ def main():
             image_paths  = img_fut.result()
             word_timings = voice_fut.result()
 
-        # Top up to 10 images from library
-        target = len(scene_prompts)
-        if len(image_paths) < target:
-            print(f"Replicate got {len(image_paths)}/{target} — pulling from library")
-            lib_imgs = get_images_from_library(scene_prompts, tmpdir)
-            for lp in lib_imgs:
-                if len(image_paths) >= target:
-                    break
-                if lp not in image_paths:
-                    image_paths.append(lp)
+        # Use whatever Replicate gave us — cycle if needed, no library downloads
+        # Library downloads take too long on Railway with bad semantic matches
+        # Pre-rendered clips will replace this entirely once clip library is built
         if not image_paths:
-            print("Library empty — trying Pexels")
-            image_paths = fetch_pexels_fallback(scene_prompts, tmpdir)
+            print("No images — using dark gradient fallback")
 
         # ── PHASE 4: PRODUCE ──────────────────────────────────────────────
         voice_dur  = get_duration(audio_path)
