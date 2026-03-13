@@ -345,68 +345,81 @@ def generate_image(description, style, tmpdir, idx):
     style_desc  = VISUAL_STYLES[style]
     full_prompt = f"{description}, {style_desc}"
 
-    try:
-        r = requests.post(
-            "https://api.replicate.com/v1/models/black-forest-labs/flux-schnell/predictions",
-            headers={
-                "Authorization": f"Bearer {REPLICATE_API_KEY}",
-                "Content-Type":  "application/json",
-                "Prefer":        "wait=60",
-            },
-            json={"input": {
-                "prompt":         full_prompt,
-                "width":          W,
-                "height":         H,
-                "num_outputs":    1,
-                "output_format":  "jpg",
-                "output_quality": 90,
-            }},
-            timeout=120
-        )
+    for attempt in range(3):
+        try:
+            if attempt > 0:
+                wait = 15 * attempt
+                print(f"  [{idx}] Retry {attempt} in {wait}s...")
+                time.sleep(wait)
 
-        if r.status_code not in (200, 201):
-            print(f"  [{idx}] Replicate {r.status_code}: {r.text[:100]}")
-            return None
+            r = requests.post(
+                "https://api.replicate.com/v1/models/black-forest-labs/flux-schnell/predictions",
+                headers={
+                    "Authorization": f"Bearer {REPLICATE_API_KEY}",
+                    "Content-Type":  "application/json",
+                    "Prefer":        "wait=60",
+                },
+                json={"input": {
+                    "prompt":         full_prompt,
+                    "width":          W,
+                    "height":         H,
+                    "num_outputs":    1,
+                    "output_format":  "jpg",
+                    "output_quality": 90,
+                }},
+                timeout=120
+            )
 
-        data = r.json()
+            if r.status_code == 429:
+                print(f"  [{idx}] Rate limited — waiting 30s")
+                time.sleep(30)
+                continue
 
-        if data.get("status") == "succeeded":
-            output = data.get("output", [])
-        else:
-            pred_id = data.get("id")
-            if not pred_id:
-                return None
-            output = None
-            for _ in range(90):
-                time.sleep(1)
-                poll = requests.get(
-                    f"https://api.replicate.com/v1/predictions/{pred_id}",
-                    headers={"Authorization": f"Bearer {REPLICATE_API_KEY}"},
-                    timeout=10
-                )
-                if poll.status_code == 200:
-                    pd = poll.json()
-                    if pd.get("status") == "succeeded":
-                        output = pd.get("output", [])
-                        break
-                    if pd.get("status") == "failed":
-                        return None
-            if not output:
+            if r.status_code not in (200, 201):
+                print(f"  [{idx}] Replicate {r.status_code}: {r.text[:100]}")
                 return None
 
-        img_url = output[0] if isinstance(output, list) else output
-        img_r   = requests.get(img_url, timeout=30)
-        if img_r.status_code != 200:
-            return None
+            data = r.json()
 
-        path = f"{tmpdir}/bulk_{idx}.jpg"
-        with open(path, "wb") as f:
-            f.write(img_r.content)
-        return path
+            if data.get("status") == "succeeded":
+                output = data.get("output", [])
+            else:
+                pred_id = data.get("id")
+                if not pred_id:
+                    return None
+                output = None
+                for _ in range(90):
+                    time.sleep(1)
+                    poll = requests.get(
+                        f"https://api.replicate.com/v1/predictions/{pred_id}",
+                        headers={"Authorization": f"Bearer {REPLICATE_API_KEY}"},
+                        timeout=10
+                    )
+                    if poll.status_code == 200:
+                        pd = poll.json()
+                        if pd.get("status") == "succeeded":
+                            output = pd.get("output", [])
+                            break
+                        if pd.get("status") == "failed":
+                            return None
+                if not output:
+                    return None
 
-    except Exception as e:
-        print(f"  [{idx}] Error: {e}")
-        return None
+            img_url = output[0] if isinstance(output, list) else output
+            img_r   = requests.get(img_url, timeout=30)
+            if img_r.status_code != 200:
+                return None
+
+            path = f"{tmpdir}/bulk_{idx}.jpg"
+            with open(path, "wb") as f:
+                f.write(img_r.content)
+            return path
+
+        except Exception as e:
+            print(f"  [{idx}] Error: {e}")
+            continue
+
+    return None
 
 
 # ── MAIN ──────────────────────────────────────────────────────────────────────
@@ -450,7 +463,7 @@ def main():
     with tempfile.TemporaryDirectory() as tmpdir:
         # Process in batches of 5 parallel workers
         # Replicate handles concurrent requests well; 5 is safe
-        with concurrent.futures.ThreadPoolExecutor(max_workers=5) as ex:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
             futures = {
                 ex.submit(generate_image, desc, style, tmpdir, i): (i, desc, style, filename)
                 for i, desc, style, filename in work
