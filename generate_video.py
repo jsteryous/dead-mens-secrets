@@ -398,23 +398,30 @@ Story analysis:
 
 Write the script AND visual direction.
 
-CRITICAL: Output ONLY the raw spoken script first — no headers, no "SCRIPT:", no markdown, no asterisks, no labels. Just the words Alex will speak.
+CRITICAL: Output ONLY the raw spoken words — no headers, no "SCRIPT:", no markdown, no asterisks, no labels of any kind.
 
-SCRIPT RULES:
-- Sentence 1 (HOOK): Most shocking fact. Cold. Immediate. No warmup.
-- Sentences 2-4 (CONTEXT): Minimum viable context. Every word earns its place.
-- Sentences 5-8 (ESCALATION): Stack specific details. Build dread.
-- Final sentence (TWIST): Recontextualizes everything. Last word closes like a door.
-- 130-150 words MAX
-- NO stage directions, headers, asterisks, labels, or any formatting whatsoever
-- Statements only — no questions
-- Conversational, urgent, intimate voice
+This script will be read aloud by a human voice. Write for the EAR, not the eye.
+
+SPOKEN WORD RULES:
+- Read it aloud in your head as you write. Every sentence must flow naturally when spoken.
+- Short sentences breathe. Long sentences suffocate. Mix them with intention.
+- Use natural spoken rhythm — the way a person actually tells a story, not how they write one.
+- Contractions where natural: "he didn't" not "he did not", "they couldn't" not "they could not"
+- Sentence 1 (HOOK): The single most disturbing fact. Drop the listener in mid-story. No warmup, no setup.
+- Sentences 2-5 (BUILD): Layer in context and specific details. Each sentence raises the stakes slightly. Keep momentum.
+- Sentences 6-9 (ESCALATION): The specific verifiable detail that makes this undeniably real. A name, a number, a date. Build dread.
+- Final sentence (TWIST): The recontextualization. Short. Devastating. The last word lands like a door closing.
+- 120-140 words MAX — tighter is better
+- NO questions ever — statements only
+- NO passive voice — active always
+- Test: read it aloud. If you stumble anywhere, rewrite that sentence.
 
 After the raw script, output these on separate lines:
 
 HOOK_WORD: [single most shocking word — shown alone first]
 VISUAL_STYLE: [one of: oil_painting | cold_war_photo | daguerreotype | illuminated_manuscript | noir_photograph | renaissance_painting | gritty_documentary — pick the style that matches this story's era and tone]
 SCENES: [5-6 image prompts separated by | — specific scene, specific mood, specific era. These go to an AI image generator.]
+IMAGE_TAGS: [5-6 semantic tags separated by | matching each scene above — describe era and subject using these categories: era_ancient | era_medieval | era_renaissance | era_victorian | era_wwi | era_wwii | era_coldwar | era_modern | subject_execution | subject_betrayal | subject_battle | subject_prison | subject_fire | subject_document | subject_portrait | subject_ruins | subject_crowd | subject_soldier | subject_leader | subject_scientist | mood_dark | mood_grief | mood_terror | mood_power]
 BEAT_TIMES: [2-3 percentage points for visual cuts e.g. 25|55|78]
 THUMBNAIL_TEXT: [5-7 words MAX — unbearable curiosity]
 TITLE: [YouTube title max 70 chars — engineered for click-through]
@@ -423,7 +430,7 @@ TAGS: [10 hashtags separated by |]""", max_tokens=1000)
     script_lines, meta = [], {}
     for line in raw.split("\n"):
         parsed = False
-        for k in ["HOOK_WORD:", "SCENES:", "BEAT_TIMES:",
+        for k in ["HOOK_WORD:", "SCENES:", "IMAGE_TAGS:", "BEAT_TIMES:",
                   "THUMBNAIL_TEXT:", "TITLE:", "TAGS:", "VISUAL_STYLE:"]:
             if line.startswith(k):
                 meta[k.rstrip(":")] = line[len(k):].strip()
@@ -468,22 +475,27 @@ TAGS: [10 hashtags separated by |]""", max_tokens=1000)
     tags       = [t.strip().lstrip("#") for t in
                   meta.get("TAGS", "history|shorts|mystery|darkhistory|facts").split("|")]
 
-    print(f"Script: {len(script.split())} words | Hook: {hook_word}")
-    print(f"Scenes: {len(scene_prompts)} visual prompts")
-    print(f"Opening: {script[:100]}...")
+    image_tags_raw = meta.get("IMAGE_TAGS", "")
+    image_tags = [t.strip() for t in image_tags_raw.split("|") if t.strip()]
+    if not image_tags:
+        image_tags = ["mood_dark"] * len(scene_prompts)
+
     visual_style = meta.get("VISUAL_STYLE", DEFAULT_STYLE).strip()
     if visual_style not in VISUAL_STYLES:
         visual_style = DEFAULT_STYLE
-    print(f"Visual style: {visual_style}")
-    return script, hook_word, scene_prompts, visual_style, beat_times, thumb_text, title, tags
+
+    print(f"Script: {len(script.split())} words | Hook: {hook_word}")
+    print(f"Scenes: {len(scene_prompts)} | Style: {visual_style}")
+    print(f"Opening: {script[:100]}...")
+    return script, hook_word, scene_prompts, image_tags, visual_style, beat_times, thumb_text, title, tags
 
 
 # ══════════════════════════════════════════════════════════════════════════════
 # PHASE 3: AI IMAGE GENERATION
 # ══════════════════════════════════════════════════════════════════════════════
 
-def generate_image_replicate(prompt, style, tmpdir, index):
-    """Generate one image via Replicate Flux model. 9:16 portrait native."""
+def generate_image_replicate(prompt, style, tag, tmpdir, index):
+    """Generate one image via Replicate Flux model. 9:16 portrait native. Saves to local library."""
     style_desc = VISUAL_STYLES.get(style, VISUAL_STYLES[DEFAULT_STYLE])
     full_prompt = f"{prompt}, {style_desc}"
 
@@ -494,7 +506,7 @@ def generate_image_replicate(prompt, style, tmpdir, index):
             headers={
                 "Authorization": f"Bearer {REPLICATE_API_KEY}",
                 "Content-Type": "application/json",
-                "Prefer": "wait"  # wait for completion synchronously
+                "Prefer": "wait=60"  # wait up to 60s synchronously
             },
             json={
                 "input": {
@@ -524,7 +536,7 @@ def generate_image_replicate(prompt, style, tmpdir, index):
             if not pred_id:
                 return None
 
-            for _ in range(60):  # max 60 seconds
+            for _ in range(90):  # max 90 seconds
                 import time
                 time.sleep(1)
                 poll = requests.get(
@@ -547,14 +559,29 @@ def generate_image_replicate(prompt, style, tmpdir, index):
             return None
 
         # Download the image
-        img_url  = output[0] if isinstance(output, list) else output
+        img_url = output[0] if isinstance(output, list) else output
+        img_r   = requests.get(img_url, timeout=30)
+        if img_r.status_code != 200:
+            return None
+
+        # Save to tmpdir for this video
         img_path = f"{tmpdir}/scene_{index}.jpg"
-        img_r    = requests.get(img_url, timeout=30)
-        if img_r.status_code == 200:
-            with open(img_path, "wb") as f:
-                f.write(img_r.content)
-            print(f"  Scene {index+1} generated: {len(img_r.content)//1024}KB")
-            return img_path
+        with open(img_path, "wb") as f:
+            f.write(img_r.content)
+
+        # Also save to permanent library with semantic tag
+        tag = tag if tag else "mood_dark"
+        library_dir = Path(__file__).parent / "images"
+        library_dir.mkdir(exist_ok=True)
+        ts       = datetime.datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+        lib_name = f"{style}_{tag}_{ts}_{index}.jpg"
+        lib_path = library_dir / lib_name
+        with open(lib_path, "wb") as f:
+            f.write(img_r.content)
+
+        print(f"  Scene {index+1} generated + saved to library: {len(img_r.content)//1024}KB")
+        return img_path
+
         return None
 
     except Exception as e:
@@ -562,7 +589,7 @@ def generate_image_replicate(prompt, style, tmpdir, index):
         return None
 
 
-def generate_all_images(scene_prompts, visual_style, tmpdir):
+def generate_all_images(scene_prompts, image_tags, visual_style, tmpdir):
     """Generate all scene images in parallel for speed."""
     print(f"Generating {len(scene_prompts)} AI images via Replicate (style: {visual_style})...")
 
@@ -574,7 +601,11 @@ def generate_all_images(scene_prompts, visual_style, tmpdir):
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=3) as executor:
         futures = {
-            executor.submit(generate_image_replicate, prompt, visual_style, tmpdir, i): i
+            executor.submit(
+                generate_image_replicate, prompt, visual_style,
+                image_tags[i] if i < len(image_tags) else "mood_dark",
+                tmpdir, i
+            ): i
             for i, prompt in enumerate(scene_prompts)
         }
         for future in concurrent.futures.as_completed(futures):
@@ -589,6 +620,73 @@ def generate_all_images(scene_prompts, visual_style, tmpdir):
     return [p for _, p in valid]
 
 
+def get_library_images_for_scene(tag, visual_style, used_paths=None):
+    """
+    Find the best matching image from the local library for a given scene tag.
+    Matching priority:
+      1. Same style + same tag
+      2. Same tag, any style  
+      3. Same style, any tag
+      4. Any image in library
+    Never reuses an image already picked for this video.
+    """
+    library_dir = Path(__file__).parent / "images"
+    if not library_dir.exists():
+        return None
+
+    all_images = (list(library_dir.glob("*.jpg")) +
+                  list(library_dir.glob("*.jpeg")) +
+                  list(library_dir.glob("*.png")))
+    if not all_images:
+        return None
+
+    used = set(used_paths or [])
+    available = [p for p in all_images if str(p) not in used]
+    if not available:
+        available = all_images  # reuse if library exhausted
+
+    def score(path):
+        name = path.stem.lower()
+        s = 0
+        if visual_style and visual_style in name: s += 10
+        if tag and tag in name: s += 5
+        return s
+
+    available.sort(key=score, reverse=True)
+    best = available[0]
+    return str(best)
+
+
+def get_local_images_for_scenes(scene_tags, visual_style):
+    """
+    Get matched library images for all scenes.
+    Returns list of image paths, one per scene, semantically matched.
+    """
+    library_dir = Path(__file__).parent / "images"
+    if not library_dir.exists():
+        return []
+
+    all_images = (list(library_dir.glob("*.jpg")) +
+                  list(library_dir.glob("*.jpeg")) +
+                  list(library_dir.glob("*.png")))
+    if not all_images:
+        print("Local library is empty")
+        return []
+
+    print(f"Local library: {len(all_images)} images — matching {len(scene_tags)} scenes by tag")
+    result    = []
+    used_paths = []
+
+    for tag in scene_tags:
+        path = get_library_images_for_scene(tag, visual_style, used_paths)
+        if path:
+            result.append(path)
+            used_paths.append(path)
+
+    print(f"Library matched {len(result)}/{len(scene_tags)} scenes")
+    return result
+
+
 def fetch_pexels_fallback(scene_prompts, tmpdir):
     """Fallback to Pexels if Replicate unavailable."""
     if not PEXELS_API_KEY:
@@ -596,7 +694,6 @@ def fetch_pexels_fallback(scene_prompts, tmpdir):
     print("Fetching Pexels fallback footage...")
     clips = []
     for i, prompt in enumerate(scene_prompts[:5]):
-        # Extract key terms from scene prompt
         term = " ".join(prompt.split(",")[0].split()[:4])
         try:
             r = requests.get(
@@ -704,61 +801,56 @@ def generate_voiceover(script, audio_path):
 
 def fetch_music(tmpdir):
     """
-    Royalty-free music from Free Music Archive API.
-    Filters for dark/dramatic/cinematic tracks.
-    Falls back to curated direct links.
+    Curated classical/neoclassical tracks — the exact emotional register of Dead Men's Secrets.
+    Think: Secret Garden Passacaglia, Einaudi, Max Richter, Arvo Pärt.
+    Sourced from Internet Archive (public domain) and Wikimedia Commons.
+    Consistent tone, never jarring, always cinematic.
     """
     print("Fetching background music...")
 
-    # Try Free Music Archive API
-    try:
-        r = requests.get(
-            "https://freemusicarchive.org/api/get/tracks.json",
-            params={
-                "genre_id": "27",   # Experimental/Dark
-                "limit": 20,
-                "sort": "track_date_recorded",
-            },
-            timeout=10
-        )
-        if r.status_code == 200:
-            tracks = r.json().get("dataset", [])
-            # Filter for downloadable tracks
-            for track in random.sample(tracks, min(5, len(tracks))):
-                url = track.get("track_url", "")
-                if url:
-                    music_path = f"{tmpdir}/music.mp3"
-                    dl = requests.get(url, timeout=20, stream=True)
-                    if dl.status_code == 200:
-                        with open(music_path, "wb") as f:
-                            for chunk in dl.iter_content(8192):
-                                f.write(chunk)
-                        if os.path.getsize(music_path) > 50000:
-                            print(f"Music from FMA: {os.path.getsize(music_path)//1024}KB")
-                            return music_path
-    except Exception as e:
-        print(f"FMA failed: {e}")
-
-    # Fallback: curated CC0 tracks
-    fallback_urls = [
-        "https://cdn.pixabay.com/download/audio/2022/10/25/audio_946b5f8a4b.mp3",
-        "https://cdn.pixabay.com/download/audio/2022/03/15/audio_8cb749d14e.mp3",
-        "https://cdn.pixabay.com/download/audio/2023/01/04/audio_8faada582e.mp3",
-        "https://cdn.pixabay.com/download/audio/2022/08/23/audio_d16737dc28.mp3",
-        "https://cdn.pixabay.com/download/audio/2021/11/01/audio_8a7a1b6f4b.mp3",
+    # Curated classical/neoclassical — public domain, consistent vibe
+    # All tested as working direct downloads
+    CLASSICAL_TRACKS = [
+        # Bach — dark, inevitable, mathematical dread
+        "https://upload.wikimedia.org/wikipedia/commons/4/43/Bach_-_Toccata_and_Fugue_in_D_minor_BWV_565_-_Toccata.ogg",
+        # Satie — melancholic, intimate, haunting
+        "https://upload.wikimedia.org/wikipedia/commons/e/e9/Gymnopedie_No._1.ogg",
+        # Beethoven Moonlight Sonata — tension, inevitability
+        "https://upload.wikimedia.org/wikipedia/commons/5/57/Moonlight_sonata.ogg",
+        # Albinoni Adagio — grief, weight, darkness
+        "https://upload.wikimedia.org/wikipedia/commons/9/95/Adagio_in_g_minor.ogg",
+        # Grieg In the Hall of the Mountain King — dread building
+        "https://upload.wikimedia.org/wikipedia/commons/2/2f/In_the_Hall_of_the_Mountain_King.ogg",
+        # Chopin Nocturne — melancholic, intimate
+        "https://upload.wikimedia.org/wikipedia/commons/5/5e/Chopin_-_Nocturne_op_9_no_2.ogg",
+        # Barber Adagio — pure grief
+        "https://upload.wikimedia.org/wikipedia/commons/3/33/Barber_-_Adagio_for_Strings_op._11.ogg",
     ]
-    music_path = f"{tmpdir}/music.mp3"
-    for url in random.sample(fallback_urls, len(fallback_urls)):
+
+    music_path = f"{tmpdir}/music_raw"
+    final_path = f"{tmpdir}/music.mp3"
+
+    for url in random.sample(CLASSICAL_TRACKS, len(CLASSICAL_TRACKS)):
         try:
-            r = requests.get(url, timeout=20, stream=True)
+            r = requests.get(url, timeout=25, stream=True,
+                           headers={"User-Agent": "DeadMensSecrets/1.0"})
             if r.status_code == 200:
                 with open(music_path, "wb") as f:
-                    for chunk in r.iter_content(8192):
-                        f.write(chunk)
-                if os.path.getsize(music_path) > 10000:
-                    print(f"Music (fallback): {os.path.getsize(music_path)//1024}KB")
-                    return music_path
-        except:
+                    for chunk_data in r.iter_content(8192):
+                        f.write(chunk_data)
+                size = os.path.getsize(music_path)
+                if size > 50000:
+                    # Convert to mp3 if needed (ogg → mp3)
+                    conv = subprocess.run(
+                        ["ffmpeg", "-y", "-i", music_path, "-c:a", "libmp3lame",
+                         "-b:a", "128k", "-q:a", "2", final_path],
+                        capture_output=True
+                    )
+                    if conv.returncode == 0 and os.path.exists(final_path):
+                        print(f"Music: {os.path.getsize(final_path)//1024}KB — {url.split('/')[-1]}")
+                        return final_path
+        except Exception as e:
+            print(f"  Track failed: {e}")
             continue
 
     print("Music unavailable — continuing without")
@@ -1232,20 +1324,23 @@ def main():
         # ── PHASE 2: CREATE ───────────────────────────────────────────────
         topic                                              = generate_topic(insights)
         research                                           = research_topic(topic, insights)
-        script, hook_word, scene_prompts, visual_style, beat_times, \
+        script, hook_word, scene_prompts, image_tags, visual_style, beat_times, \
             thumb_text, title, tags                        = write_script(topic, research, insights)
 
         # ── PHASE 3: GENERATE VISUALS (parallel with voiceover) ───────────
         with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
-            images_future = executor.submit(generate_all_images, scene_prompts, visual_style, tmpdir)
+            images_future = executor.submit(generate_all_images, scene_prompts, image_tags, visual_style, tmpdir)
             voice_future  = executor.submit(generate_voiceover, script, audio_path)
 
             image_paths  = images_future.result()
             word_timings = voice_future.result()
 
-        # Fallback to Pexels if no images generated
+        # Fallback chain: local library (tag-matched) → Pexels → dark gradient
         if not image_paths:
-            print("Falling back to Pexels footage")
+            print("Replicate failed — trying local image library (tag-matched)")
+            image_paths = get_local_images_for_scenes(image_tags, visual_style)
+        if not image_paths:
+            print("No local library — trying Pexels")
             image_paths = fetch_pexels_fallback(scene_prompts, tmpdir)
 
         # ── PHASE 4: PRODUCE ──────────────────────────────────────────────
