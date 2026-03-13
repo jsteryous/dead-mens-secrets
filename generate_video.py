@@ -1508,56 +1508,64 @@ def assemble_video(word_timings, hook_word, audio_path, bg_path,
 
     vf = ",".join(filters)
 
-    # Write filter to file — avoids command line length limit with many captions
-    vf_file = f"{os.path.dirname(output_path)}/vf.txt"
+    # Write vf filter to script file — avoids OS command line length limit
+    # -filter_script is supported in all FFmpeg versions
+    vf_file = f"{os.path.dirname(output_path)}/vf_script.txt"
     with open(vf_file, "w") as f:
         f.write(vf)
 
+    af = None
     if music_path and os.path.exists(music_path):
         af = (f"[1:a]volume=1.0[voice];"
               f"[2:a]volume=0.08,"
               f"afade=t=in:st={HOOK_DUR}:d=2.5,"
               f"afade=t=out:st={total_dur-2.0}:d=1.8[music];"
               f"[voice][music]amix=inputs=2:duration=first[aout]")
-        cmd = ["ffmpeg", "-y",
-               "-i", bg_path, "-i", audio_path, "-i", music_path,
-               "-filter_complex", af,
-               "-vf", f"file:{vf_file}",
-               "-map", "0:v", "-map", "[aout]",
-               "-c:v", "libx264", "-preset", "fast", "-crf", "18",
-               "-c:a", "aac", "-b:a", "192k",
-               "-t", str(total_dur),
-               "-movflags", "+faststart", "-pix_fmt", "yuv420p",
-               output_path]
-    else:
-        cmd = ["ffmpeg", "-y",
-               "-i", bg_path, "-i", audio_path,
-               "-vf", f"file:{vf_file}",
-               "-c:v", "libx264", "-preset", "fast", "-crf", "18",
-               "-c:a", "aac", "-b:a", "192k",
-               "-shortest", "-movflags", "+faststart", "-pix_fmt", "yuv420p",
-               output_path]
 
-    r = run(cmd, check=False)
-    if r.returncode != 0:
-        # Fallback: pass vf directly (may hit limit but worth trying)
-        print(f"Retry with inline vf...")
-        if music_path and os.path.exists(music_path):
-            cmd2 = ["ffmpeg", "-y",
+    def make_cmd(use_script=True):
+        vf_arg = ["-filter_script:v", vf_file] if use_script else ["-vf", vf]
+        if af:
+            return ["ffmpeg", "-y",
                     "-i", bg_path, "-i", audio_path, "-i", music_path,
-                    "-filter_complex", af, "-vf", vf,
+                    "-filter_complex", af] + vf_arg + [
                     "-map", "0:v", "-map", "[aout]",
                     "-c:v", "libx264", "-preset", "fast", "-crf", "18",
                     "-c:a", "aac", "-b:a", "192k",
                     "-t", str(total_dur),
-                    "-movflags", "+faststart", "-pix_fmt", "yuv420p", output_path]
+                    "-movflags", "+faststart", "-pix_fmt", "yuv420p",
+                    output_path]
         else:
-            cmd2 = ["ffmpeg", "-y",
-                    "-i", bg_path, "-i", audio_path,
-                    "-vf", vf, "-c:v", "libx264", "-preset", "fast", "-crf", "18",
-                    "-c:a", "aac", "-b:a", "192k", "-shortest",
-                    "-movflags", "+faststart", "-pix_fmt", "yuv420p", output_path]
-        run(cmd2, check=False)
+            return ["ffmpeg", "-y",
+                    "-i", bg_path, "-i", audio_path] + vf_arg + [
+                    "-c:v", "libx264", "-preset", "fast", "-crf", "18",
+                    "-c:a", "aac", "-b:a", "192k",
+                    "-shortest", "-movflags", "+faststart",
+                    "-pix_fmt", "yuv420p", output_path]
+
+    r = run(make_cmd(use_script=True), check=False)
+    if r.returncode != 0 or not os.path.exists(output_path):
+        print("Retry with inline vf...")
+        r2 = run(make_cmd(use_script=False), check=False)
+        if r2.returncode != 0 or not os.path.exists(output_path):
+            # Last resort: strip captions, just branding + hook word
+            print("Retry with minimal filters...")
+            minimal_vf = ",".join(filters[:4])  # vignette, fade, branding, hook only
+            min_cmd = (["ffmpeg", "-y",
+                        "-i", bg_path, "-i", audio_path, "-i", music_path,
+                        "-filter_complex", af, "-vf", minimal_vf,
+                        "-map", "0:v", "-map", "[aout]",
+                        "-c:v", "libx264", "-preset", "fast", "-crf", "18",
+                        "-c:a", "aac", "-b:a", "192k",
+                        "-t", str(total_dur), "-movflags", "+faststart",
+                        "-pix_fmt", "yuv420p", output_path]
+                       if af else
+                       ["ffmpeg", "-y",
+                        "-i", bg_path, "-i", audio_path,
+                        "-vf", minimal_vf,
+                        "-c:v", "libx264", "-preset", "fast", "-crf", "18",
+                        "-c:a", "aac", "-b:a", "192k", "-shortest",
+                        "-movflags", "+faststart", "-pix_fmt", "yuv420p", output_path])
+            run(min_cmd, check=False)
 
     if os.path.exists(output_path):
         print(f"Final video: {os.path.getsize(output_path)/1048576:.1f}MB, {total_dur:.1f}s")
