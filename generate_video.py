@@ -71,18 +71,8 @@ VISUAL_STYLES = {
 DEFAULT_STYLE = "oil_painting"
 
 # ── MUSIC ─────────────────────────────────────────────────────────────────────
-# Pulled from Supabase Storage music/ bucket — your approved tracks only.
-# Upload any audio file (mp3, ogg, wav) to the music/ bucket in Supabase.
-# Falls back to public domain Wikimedia tracks if bucket is empty.
-FALLBACK_TRACKS = [
-    "https://upload.wikimedia.org/wikipedia/commons/4/43/Bach_-_Toccata_and_Fugue_in_D_minor_BWV_565_-_Toccata.ogg",
-    "https://upload.wikimedia.org/wikipedia/commons/e/e9/Gymnopedie_No._1.ogg",
-    "https://upload.wikimedia.org/wikipedia/commons/5/57/Moonlight_sonata.ogg",
-    "https://upload.wikimedia.org/wikipedia/commons/9/95/Adagio_in_g_minor.ogg",
-    "https://upload.wikimedia.org/wikipedia/commons/2/2f/In_the_Hall_of_the_Mountain_King.ogg",
-    "https://upload.wikimedia.org/wikipedia/commons/5/5e/Chopin_-_Nocturne_op_9_no_2.ogg",
-    "https://upload.wikimedia.org/wikipedia/commons/3/33/Barber_-_Adagio_for_Strings_op._11.ogg",
-]
+# Primary: Supabase Storage music/ bucket — upload your approved tracks there.
+# Fallback: ambient_fallback.mp3 committed to repo — always works, no network.
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -697,7 +687,7 @@ def generate_one_image(prompt, style, tmpdir, index):
             "https://api.replicate.com/v1/models/black-forest-labs/flux-schnell/predictions",
             headers={"Authorization":  f"Bearer {REPLICATE_API_KEY}",
                      "Content-Type":   "application/json",
-                     "Prefer":         "wait=90"},
+                     "Prefer":         "wait=60"},
             json={"input": {"prompt":        full_prompt,
                             "width":         1080,
                             "height":        1920,
@@ -926,15 +916,22 @@ def list_music_from_supabase():
 
 def fetch_music(tmpdir):
     """
-    Fetch a random approved track from Supabase Storage music/ bucket.
-    Falls back to public domain Wikimedia tracks if bucket is empty.
-    Converts any format to mp3 via FFmpeg for consistent pipeline handling.
+    Fetch music for the video.
+
+    Priority:
+    1. Supabase music/ bucket — your approved tracks (upload via dashboard)
+    2. Committed fallback file — ambient_fallback.mp3 in the repo
+       A 90s dark ambient drone generated via FFmpeg sine waves.
+       Always available, no network needed, never fails.
+
+    Note: External music URLs (Wikimedia, Archive.org) are blocked by
+    Railway's network proxy. Supabase is the only external source that works.
     """
     print("Fetching music...")
-    raw_path   = f"{tmpdir}/music_raw"
     final_path = f"{tmpdir}/music.mp3"
 
     def try_download_and_convert(url, label):
+        raw_path = f"{tmpdir}/music_raw"
         try:
             r = requests.get(url, timeout=30, stream=True,
                              headers={"User-Agent": "DeadMensSecrets/1.0"})
@@ -947,7 +944,7 @@ def fetch_music(tmpdir):
                 return False
             conv = subprocess.run(
                 ["ffmpeg", "-y", "-i", raw_path,
-                 "-c:a", "libmp3lame", "-b:a", "128k", "-q:a", "2", final_path],
+                 "-c:a", "libmp3lame", "-b:a", "128k", final_path],
                 capture_output=True
             )
             if conv.returncode == 0 and os.path.exists(final_path):
@@ -957,22 +954,24 @@ def fetch_music(tmpdir):
             print(f"  Track failed ({label}): {e}")
         return False
 
-    # Try Supabase music bucket first
+    # 1. Try Supabase music bucket — your approved tracks
     tracks = list_music_from_supabase()
     if tracks:
-        print(f"  Found {len(tracks)} tracks in Supabase music library")
+        print(f"  {len(tracks)} tracks in Supabase music library")
         for name, url in random.sample(tracks, len(tracks)):
             if try_download_and_convert(url, name):
                 return final_path
-        print("  All Supabase tracks failed — trying fallback")
+        print("  Supabase tracks failed")
 
-    # Fallback: public domain Wikimedia
-    print("  Using fallback public domain tracks")
-    for url in random.sample(FALLBACK_TRACKS, len(FALLBACK_TRACKS)):
-        if try_download_and_convert(url, url.split("/")[-1]):
-            return final_path
+    # 2. Committed fallback — always works, no network needed
+    fallback = Path(__file__).parent / "ambient_fallback.mp3"
+    if fallback.exists():
+        import shutil
+        shutil.copy(str(fallback), final_path)
+        print(f"Music: using committed ambient fallback ({fallback.stat().st_size//1024}KB)")
+        return final_path
 
-    print("Music unavailable — proceeding without")
+    print("Music unavailable")
     return None
 
 
